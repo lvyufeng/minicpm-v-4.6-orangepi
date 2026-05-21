@@ -237,4 +237,56 @@ void full_attention_decoder_layer(const Tensor& hidden,
     add(after_attn, mlp_out, out, stream);
 }
 
+void linear_attention_decoder_layer_stub(const Tensor& hidden,
+                                         const LinearAttentionDecoderLayerWeights& weights,
+                                         const LinearAttentionDecoderLayerConfig& config,
+                                         Tensor& out,
+                                         aclrtStream stream) {
+    check_ptr(weights.input_norm_weight, "linear input_norm_weight");
+    check_ptr(weights.post_attention_norm_weight, "linear post_attention_norm_weight");
+    check_ptr(weights.gate_proj_weight, "linear gate_proj_weight");
+    check_ptr(weights.up_proj_weight, "linear up_proj_weight");
+    check_ptr(weights.down_proj_weight, "linear down_proj_weight");
+
+    if (hidden.shape().size() != 2 || out.shape() != hidden.shape()) {
+        throw std::runtime_error("linear decoder layer hidden/out must be [T, H] and same shape");
+    }
+    if (hidden.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("linear decoder layer requires fp16 hidden/out");
+    }
+
+    const int64_t T = hidden.shape()[0];
+    const int64_t Hidden = hidden.shape()[1];
+    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    if (weights.input_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
+        weights.post_attention_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
+        weights.gate_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
+        weights.up_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
+        weights.down_proj_weight->shape() != std::vector<int64_t>{Hidden, Intermediate}) {
+        throw std::runtime_error("linear decoder layer weight shape mismatch");
+    }
+
+    Tensor normed({T, Hidden}, DType::Float16); normed.allocate();
+    rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
+
+    Tensor after_attn({T, Hidden}, DType::Float16); after_attn.allocate();
+    add(hidden, normed, after_attn, stream);
+
+    Tensor mlp_in({T, Hidden}, DType::Float16); mlp_in.allocate();
+    rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
+
+    Tensor gate({T, Intermediate}, DType::Float16); gate.allocate();
+    Tensor up({T, Intermediate}, DType::Float16); up.allocate();
+    Tensor gate_act({T, Intermediate}, DType::Float16); gate_act.allocate();
+    Tensor gated({T, Intermediate}, DType::Float16); gated.allocate();
+    Tensor mlp_out({T, Hidden}, DType::Float16); mlp_out.allocate();
+
+    matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
+    matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
+    silu(gate, gate_act, stream);
+    mul(gate_act, up, gated, stream);
+    matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
+    add(after_attn, mlp_out, out, stream);
+}
+
 }  // namespace minicpmv
