@@ -1,0 +1,42 @@
+# Model weights and downloaded assets
+MiniCPM-V-4.6/
+ms_probe/
+*.safetensors
+*.bin
+*.onnx
+*.mindir
+*.om
+
+# Build outputs
+build_out/
+custom_opp_install/
+custom_ops/build_out/
+engine/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+*.o
+*.a
+*.so
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs and generated probes
+*.log
+fusion_result.json
+profile_*.py
+run_minicpm_v_46_npu.py
+smoke_npu_fused_ops.py
+test_npu_*.py
+test_rope_infer_ops.py
+test_image.png
+custom_ops/test_add_custom_aclnn
+custom_ops/test_rms_norm1024_aclnn
+
+# Local/editor noise
+.cache/
+._____temp
+*.tmp
