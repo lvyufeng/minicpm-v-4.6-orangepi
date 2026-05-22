@@ -78,6 +78,61 @@ int64_t per_token_prefill(const Tensor& prompt_hidden,
     return lm_head_greedy(hidden, w, cfg, stream);
 }
 
+// "No-cache" reference: run full+linear multi-token decoder layers without
+// touching DecodeState. Same as `linear_attention_decoder_layer` (single
+// gated_delta_rule kernel launch, no per-row loop) and the old
+// `full_attention_decoder_layer`. Upper bound on speed for a 2-pass prefill.
+int64_t no_cache_prefill(const Tensor& prompt_hidden,
+                         const LanguageModelWeights& w,
+                         const LanguageModelConfig& cfg,
+                         const Tensor& cos_table,
+                         const Tensor& sin_table,
+                         aclrtStream stream) {
+    const int64_t T = prompt_hidden.shape()[0];
+    const int64_t H = cfg.hidden_size;
+    Tensor hidden({T, H}, DType::Float16); hidden.allocate();
+    Tensor next({T, H}, DType::Float16); next.allocate();
+    check_acl(aclrtMemcpyAsync(hidden.data(), hidden.size_bytes(), prompt_hidden.data(),
+                               prompt_hidden.size_bytes(), ACL_MEMCPY_DEVICE_TO_DEVICE, stream), "nc copy");
+    check_acl(aclrtSynchronizeStream(stream), "nc copy sync");
+
+    std::vector<int32_t> row_to_t(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) row_to_t[t] = static_cast<int32_t>(t);
+
+    LinearAttentionDecoderLayerConfig lcfg{cfg.rms_epsilon};
+    FullAttentionDecoderLayerConfig fcfg{cfg.num_q_heads, cfg.num_kv_heads,
+                                         cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon};
+
+    for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
+        const auto& lw = w.layers[layer];
+        if (cfg.layer_types[layer] == "linear_attention") {
+            LinearAttentionDecoderLayerWeights ww{
+                &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
+                &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
+                &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+            };
+            linear_attention_decoder_layer(hidden, ww, lcfg, next, stream);
+        } else {
+            FullAttentionDecoderLayerWeights ww{
+                &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
+                &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+            };
+            full_attention_decoder_layer(hidden, ww, cos_table, sin_table, row_to_t, fcfg, next, stream);
+        }
+        check_acl(aclrtMemcpyAsync(hidden.data(), hidden.size_bytes(), next.data(), next.size_bytes(),
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream), "nc layer copy");
+        check_acl(aclrtSynchronizeStream(stream), "nc layer copy sync");
+    }
+
+    Tensor last({1, H}, DType::Float16); last.allocate();
+    const size_t row_bytes = static_cast<size_t>(H) * dtype_size(hidden.dtype());
+    auto* src = static_cast<const uint8_t*>(hidden.data()) + static_cast<size_t>(T - 1) * row_bytes;
+    check_acl(aclrtMemcpyAsync(last.data(), row_bytes, src, row_bytes,
+                               ACL_MEMCPY_DEVICE_TO_DEVICE, stream), "nc last");
+    check_acl(aclrtSynchronizeStream(stream), "nc last sync");
+    return lm_head_greedy(last, w, cfg, stream);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -96,8 +151,9 @@ int main(int argc, char** argv) {
     FullAttentionDecoderLayerConfig fcfg{cfg.num_q_heads, cfg.num_kv_heads,
                                          cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon};
 
-    std::printf("%-6s %-12s %-12s %-8s %-10s %-10s\n",
-                "T", "batched_ms", "per_token_ms", "speedup", "batch_tok", "ref_tok");
+    std::printf("%-6s %-12s %-12s %-12s %-10s %-10s %-10s %-10s\n",
+                "T", "no_cache_ms", "batched_ms", "per_token_ms", "nc_speedup", "b_speedup",
+                "batch_tok", "ref_tok");
 
     for (int64_t T : Ts) {
         std::vector<int32_t> tokens(static_cast<size_t>(T));
@@ -117,6 +173,21 @@ int main(int argc, char** argv) {
         }
 
         const int iters = 2;
+
+        // No-cache (multi-token, single gated_delta_rule kernel launch).
+        (void)no_cache_prefill(prompt_hidden, w, cfg, cos_t, sin_t, ctx.stream());  // warmup
+        double no_cache_ms = 0;
+        int64_t no_cache_tok = 0;
+        for (int i = 0; i < iters; ++i) {
+            check_acl(aclrtSynchronizeStream(ctx.stream()), "pre-nc sync");
+            auto t0 = clk::now();
+            no_cache_tok = no_cache_prefill(prompt_hidden, w, cfg, cos_t, sin_t, ctx.stream());
+            check_acl(aclrtSynchronizeStream(ctx.stream()), "nc sync");
+            auto t1 = clk::now();
+            no_cache_ms += ms(t0, t1);
+        }
+        no_cache_ms /= iters;
+
         double batched_ms = 0;
         int64_t batched_tok = 0;
         for (int i = 0; i < iters; ++i) {
@@ -151,11 +222,12 @@ int main(int argc, char** argv) {
         }
         per_tok_ms /= iters;
 
-        std::printf("%-6lld %-12.1f %-12.1f %-8.2fx %-10lld %-10lld\n",
-                    static_cast<long long>(T), batched_ms, per_tok_ms,
-                    per_tok_ms / batched_ms,
+        std::printf("%-6lld %-12.1f %-12.1f %-12.1f %-10.2fx %-10.2fx %-10lld %-10lld\n",
+                    static_cast<long long>(T), no_cache_ms, batched_ms, per_tok_ms,
+                    per_tok_ms / no_cache_ms, per_tok_ms / batched_ms,
                     static_cast<long long>(batched_tok),
                     static_cast<long long>(per_tok_tok));
+        (void)no_cache_tok;
     }
     return 0;
 }
