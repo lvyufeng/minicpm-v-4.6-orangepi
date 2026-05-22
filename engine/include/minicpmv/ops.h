@@ -78,7 +78,7 @@ void linear_gated_delta_rule(const Tensor& mixed,
 // Single-step gated delta rule with persistent recurrent state on device.
 // mixed: [1, 6144] fp16, beta/decay: [1, 16] fp16
 // state: [16, 128, 128] fp32 (read+written in place)
-// scratch: [5120] fp32 (8 blocks * 5 * head_dim temp buffers)
+// scratch: [6144] fp32 (8 blocks * 6 * head_dim temp buffers)
 // out: [1, 2048] fp16
 void linear_gated_delta_rule_step(const Tensor& mixed,
                                   const Tensor& beta,

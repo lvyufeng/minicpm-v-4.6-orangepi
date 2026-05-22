@@ -869,9 +869,9 @@ void linear_gated_delta_rule_step(const Tensor& mixed,
     if (state.shape() != std::vector<int64_t>{16, 128, 128}) {
         throw std::runtime_error("linear_gated_delta_rule_step state must be [16, 128, 128] fp32");
     }
-    constexpr int64_t kScratchElems = 8 * 5 * 128;
+    constexpr int64_t kScratchElems = 8 * 6 * 128;
     if (scratch.shape().size() != 1 || scratch.shape()[0] != kScratchElems) {
-        throw std::runtime_error("linear_gated_delta_rule_step scratch must be [5120] fp32");
+        throw std::runtime_error("linear_gated_delta_rule_step scratch must be [6144] fp32");
     }
     if (out.shape() != std::vector<int64_t>{1, 2048}) {
         throw std::runtime_error("linear_gated_delta_rule_step out must be [1, 2048]");

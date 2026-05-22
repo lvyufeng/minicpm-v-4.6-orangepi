@@ -21,6 +21,7 @@ public:
         vBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 2 * HEAD_DIM_I, HEAD_DIM_I);
         kvBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 3 * HEAD_DIM_I, HEAD_DIM_I);
         dBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 4 * HEAD_DIM_I, HEAD_DIM_I);
+        outFloatBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 5 * HEAD_DIM_I, HEAD_DIM_I);
     }
 
     __aicore__ inline void Process() {
@@ -28,12 +29,13 @@ public:
         const int32_t headEnd = headStart + HEADS_PER_BLOCK;
         for (int32_t h = headStart; h < headEnd; ++h) {
             const int32_t stateBase = h * STATE_ELEMS;
-
-            float qNorm = 0.0f;
-            float kNorm = 0.0f;
             const int32_t qBase = h * HEAD_DIM_I;
             const int32_t kBase = KEY_DIM_I + h * HEAD_DIM_I;
             const int32_t vBase = 2 * KEY_DIM_I + h * HEAD_DIM_I;
+
+            // Load q, k, v into scratch as fp32, computing q/k l2 norms along the way.
+            float qNorm = 0.0f;
+            float kNorm = 0.0f;
             for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
                 float qv = static_cast<float>(mixedGm.GetValue(qBase + i));
                 float kv = static_cast<float>(mixedGm.GetValue(kBase + i));
@@ -51,36 +53,41 @@ public:
                 kBuf.SetValue(i, kBuf.GetValue(i) * kInv);
             }
 
-            float beta = static_cast<float>(betaGm.GetValue(h));
-            float decay = static_cast<float>(decayGm.GetValue(h));
+            const float beta = static_cast<float>(betaGm.GetValue(h));
+            const float decay = static_cast<float>(decayGm.GetValue(h));
+
+            // Pass A: apply decay, compute kv = state' . k, then delta = (v - kv) * beta.
+            // Each state element is read once and written once.
+            for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
+                kvBuf.SetValue(j, 0.0f);
+            }
             for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
+                const float kVal = kBuf.GetValue(i);
+                const int32_t rowBase = stateBase + i * HEAD_DIM_I;
                 for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                    stateGm.SetValue(stateBase + i * HEAD_DIM_I + j,
-                                     stateGm.GetValue(stateBase + i * HEAD_DIM_I + j) * decay);
+                    float s = stateGm.GetValue(rowBase + j) * decay;
+                    stateGm.SetValue(rowBase + j, s);
+                    kvBuf.SetValue(j, kvBuf.GetValue(j) + s * kVal);
                 }
+            }
+            for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
+                dBuf.SetValue(j, (vBuf.GetValue(j) - kvBuf.GetValue(j)) * beta);
+                outFloatBuf.SetValue(j, 0.0f);
             }
 
-            for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                float acc = 0.0f;
-                for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                    acc += stateGm.GetValue(stateBase + i * HEAD_DIM_I + j) * kBuf.GetValue(i);
-                }
-                kvBuf.SetValue(j, acc);
-                dBuf.SetValue(j, (vBuf.GetValue(j) - acc) * beta);
-            }
+            // Pass B: add outer(k, delta) into state and accumulate out = state_final . q.
             for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                float kVal = kBuf.GetValue(i);
+                const float kVal = kBuf.GetValue(i);
+                const float qVal = qBuf.GetValue(i);
+                const int32_t rowBase = stateBase + i * HEAD_DIM_I;
                 for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                    stateGm.SetValue(stateBase + i * HEAD_DIM_I + j,
-                                     stateGm.GetValue(stateBase + i * HEAD_DIM_I + j) + kVal * dBuf.GetValue(j));
+                    float s = stateGm.GetValue(rowBase + j) + kVal * dBuf.GetValue(j);
+                    stateGm.SetValue(rowBase + j, s);
+                    outFloatBuf.SetValue(j, outFloatBuf.GetValue(j) + s * qVal);
                 }
             }
             for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                float acc = 0.0f;
-                for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                    acc += stateGm.GetValue(stateBase + i * HEAD_DIM_I + j) * qBuf.GetValue(i);
-                }
-                outGm.SetValue(h * HEAD_DIM_I + j, static_cast<half>(acc));
+                outGm.SetValue(h * HEAD_DIM_I + j, static_cast<half>(outFloatBuf.GetValue(j)));
             }
         }
     }
@@ -93,7 +100,7 @@ private:
     static constexpr int32_t CONV_DIM_I = 6144;
     static constexpr int32_t STATE_ELEMS = HEAD_DIM_I * HEAD_DIM_I;
     static constexpr int32_t HEADS_PER_BLOCK = 2;
-    static constexpr int32_t SCRATCH_PER_BLOCK = 5 * HEAD_DIM_I;
+    static constexpr int32_t SCRATCH_PER_BLOCK = 6 * HEAD_DIM_I;
     static constexpr float EPSILON = 0.000001f;
     static constexpr float Q_SCALE = 0.08838834764831845f;
     GlobalTensor<half> mixedGm;
@@ -106,6 +113,7 @@ private:
     GlobalTensor<float> vBuf;
     GlobalTensor<float> kvBuf;
     GlobalTensor<float> dBuf;
+    GlobalTensor<float> outFloatBuf;
     int32_t blockIdx;
 };
 

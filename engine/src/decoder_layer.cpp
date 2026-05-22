@@ -837,7 +837,7 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     decay_dev.copy_from_host(decay_h.data(), decay_h.size() * sizeof(uint16_t));
 
     Tensor core_dev({1, ValueDim}, DType::Float16); core_dev.allocate();
-    Tensor scratch({8 * 5 * 128}, DType::Float32); scratch.allocate();
+    Tensor scratch({8 * 6 * 128}, DType::Float32); scratch.allocate();
     linear_gated_delta_rule_step(mixed, beta_dev, decay_dev, cache.recurrent_state, scratch, core_dev, stream);
 
     Tensor z_silu({1, ValueDim}, DType::Float16); z_silu.allocate();
