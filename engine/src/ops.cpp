@@ -24,6 +24,7 @@
 #include "aclnn_gated_rms_norm_z_custom.h"
 #include "aclnn_attention_step_custom.h"
 #include "aclnn_silu_mul_custom.h"
+#include "aclnn_matmul_vec_custom.h"
 
 namespace minicpmv {
 
@@ -156,6 +157,14 @@ void matmul_b_transposed(const Tensor& a, const Tensor& b, Tensor& out, aclrtStr
     if (a.shape()[0] != out.shape()[0] || b.shape()[0] != out.shape()[1]) {
         throw std::runtime_error("matmul_b_transposed out shape mismatch");
     }
+
+    // NOTE: We have a custom aclnnMatmulVecCustom kernel for the M=1 case
+    // (vector-by-matrix), but it's ~30-40% slower than aclnnMm in practice.
+    // aclnnMm uses the cube unit which is well-tuned even for T=1; a pure
+    // vector-unit Mul + ReduceSum loop can't compete. Keeping the kernel in
+    // the tree as a reference. The real lever for decode at T=1 is matmul
+    // stacking (qkv+, gate+up) and/or weight quantization, not a hand-rolled
+    // T=1 matmul. See engine/build/bench_matmul_vec for the data.
 
     AclTensorHandle ha, hb, ho;
     make_acl_tensor(a, ha);
