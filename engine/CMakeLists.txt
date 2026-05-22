@@ -15,6 +15,7 @@ add_library(minicpmv_engine
   src/weights.cpp
   src/ops.cpp
   src/decoder_layer.cpp
+  src/language_model.cpp
 )
 
 target_include_directories(minicpmv_engine PUBLIC
@@ -93,3 +94,7 @@ add_executable(test_incremental_decode tests/test_incremental_decode.cpp)
 target_link_libraries(test_incremental_decode PRIVATE minicpmv_engine)
 add_executable(test_language_logits_dump tests/test_language_logits_dump.cpp)
 target_link_libraries(test_language_logits_dump PRIVATE minicpmv_engine)
+add_executable(test_prefill_from_embeddings tests/test_prefill_from_embeddings.cpp)
+target_link_libraries(test_prefill_from_embeddings PRIVATE minicpmv_engine)
+add_executable(minicpmv_hybrid_decode tools/minicpmv_hybrid_decode.cpp)
+target_link_libraries(minicpmv_hybrid_decode PRIVATE minicpmv_engine)
