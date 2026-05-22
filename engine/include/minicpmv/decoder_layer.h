@@ -5,6 +5,7 @@
 #include <acl/acl.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace minicpmv {
@@ -44,11 +45,9 @@ struct LinearAttentionDecoderLayerConfig {
     double rms_epsilon;
 };
 
-// TODO: real linear-attention uses in_proj_qkvz / in_proj_ba, conv1d, A_log,
-// dt_bias, gated delta rule recurrence, gated RMSNorm, and out_proj. For now
-// this stub keeps the residual + MLP skeleton so multi-layer wiring can be
-// validated end-to-end on real weights.
-struct LinearAttentionDecoderLayerWeights {
+// Stub-only weights (residual + MLP skeleton). Real linear-attention path uses
+// `LinearAttentionDecoderLayerWeights` below.
+struct LinearAttentionDecoderLayerStubWeights {
     const Tensor* input_norm_weight;
     const Tensor* post_attention_norm_weight;
     const Tensor* gate_proj_weight;
@@ -57,9 +56,88 @@ struct LinearAttentionDecoderLayerWeights {
 };
 
 void linear_attention_decoder_layer_stub(const Tensor& hidden,
-                                         const LinearAttentionDecoderLayerWeights& weights,
+                                         const LinearAttentionDecoderLayerStubWeights& weights,
                                          const LinearAttentionDecoderLayerConfig& config,
                                          Tensor& out,
+                                         aclrtStream stream);
+
+// Real NPU linear-attention layer. Currently fixed at:
+// - hidden_size = 1024
+// - num_heads   = 16
+// - head_dim    = 128
+// - conv kernel = 4
+// host pre-computes beta = sigmoid(b) and decay = exp(-exp(A_log)*softplus(a + dt_bias)).
+struct LinearAttentionDecoderLayerWeights {
+    const Tensor* input_norm_weight;
+    const Tensor* post_attention_norm_weight;
+    const Tensor* in_proj_qkv_weight;
+    const Tensor* in_proj_z_weight;
+    const Tensor* in_proj_a_weight;
+    const Tensor* in_proj_b_weight;
+    const Tensor* conv1d_weight;
+    const Tensor* dt_bias;
+    const Tensor* a_log;
+    const Tensor* gated_norm_weight;
+    const Tensor* out_proj_weight;
+    const Tensor* gate_proj_weight;
+    const Tensor* up_proj_weight;
+    const Tensor* down_proj_weight;
+};
+
+void linear_attention_decoder_layer(const Tensor& hidden,
+                                    const LinearAttentionDecoderLayerWeights& weights,
+                                    const LinearAttentionDecoderLayerConfig& config,
+                                    Tensor& out,
+                                    aclrtStream stream);
+
+// Single-token decode caches and entry points.
+struct FullAttentionLayerCache {
+    Tensor k_cache;  // [max_seq, num_kv_heads * head_dim] fp16, post-RoPE K rows
+    Tensor v_cache;  // [max_seq, num_kv_heads * head_dim] fp16, V rows
+};
+
+struct LinearAttentionLayerCache {
+    Tensor conv_buf;          // [3, 6144] fp16, last 3 conv inputs (pre-conv qkv projection)
+    Tensor recurrent_state;   // [16, 128, 128] fp32, gated delta rule state
+};
+
+struct DecodeState {
+    int64_t max_seq_len{0};
+    int64_t seq_len{0};
+    std::vector<FullAttentionLayerCache> full;
+    std::vector<LinearAttentionLayerCache> linear;
+};
+
+// Allocate caches for each layer in `layer_types` ("full_attention" or
+// "linear_attention"), zero-initialize state buffers. Sized to `max_seq_len`
+// tokens for full-attention K/V caches.
+DecodeState make_decode_state(int64_t max_seq_len,
+                              const std::vector<std::string>& layer_types,
+                              const FullAttentionDecoderLayerConfig& full_config,
+                              aclrtStream stream);
+
+// Single-token full-attention step. `pos` is the absolute position of this
+// token; `cache_len` is the number of valid tokens already in K/V (rows [0,
+// cache_len) are valid; this call writes row `cache_len`). Caller bumps
+// `seq_len` after the step.
+void full_attention_decoder_layer_step(const Tensor& hidden_1xH,
+                                       const FullAttentionDecoderLayerWeights& weights,
+                                       const Tensor& cos_table,
+                                       const Tensor& sin_table,
+                                       int32_t pos,
+                                       int64_t cache_len,
+                                       const FullAttentionDecoderLayerConfig& config,
+                                       FullAttentionLayerCache& cache,
+                                       Tensor& out_1xH,
+                                       aclrtStream stream);
+
+// Single-token linear-attention step using device-resident conv buffer and
+// recurrent state in `cache`.
+void linear_attention_decoder_layer_step(const Tensor& hidden_1xH,
+                                         const LinearAttentionDecoderLayerWeights& weights,
+                                         const LinearAttentionDecoderLayerConfig& config,
+                                         LinearAttentionLayerCache& cache,
+                                         Tensor& out_1xH,
                                          aclrtStream stream);
 
 }  // namespace minicpmv

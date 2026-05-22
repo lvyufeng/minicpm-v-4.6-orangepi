@@ -1,0 +1,14 @@
+{
+  "op": "LinearGatedDeltaRuleStepCustom",
+  "input_desc": [
+    {"name": "mixed", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "beta", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "decay", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "state", "param_type": "required", "format": ["ND"], "type": ["float"]},
+    {"name": "scratch", "param_type": "required", "format": ["ND"], "type": ["float"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

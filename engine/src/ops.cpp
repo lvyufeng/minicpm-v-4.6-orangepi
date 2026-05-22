@@ -17,6 +17,10 @@
 #include <aclnnop/aclnn_rsqrt.h>
 #include <aclnnop/aclnn_sub.h>
 #include "aclnn_rms_norm1024_custom.h"
+#include "aclnn_linear_causal_conv_custom.h"
+#include "aclnn_linear_gated_delta_rule_custom.h"
+#include "aclnn_linear_gated_delta_rule_step_custom.h"
+#include "aclnn_gated_rms_norm_z_custom.h"
 
 namespace minicpmv {
 
@@ -232,6 +236,7 @@ void run_op(const char* name,
     void* workspace = nullptr;
     if (ws_size > 0) {
         check_acl(aclrtMalloc(&workspace, ws_size, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc workspace");
+        check_acl(aclrtMemsetAsync(workspace, ws_size, 0, ws_size, stream), "aclrtMemsetAsync workspace");
     }
     auto ret = launch(workspace, ws_size, executor, stream);
     if (ret != 0) {
@@ -698,6 +703,190 @@ void apply_rope_partial(const Tensor& x,
         }
     }
     check_acl(aclrtSynchronizeStream(stream), "rope scatter sync");
+}
+
+void linear_causal_conv(const Tensor& x,
+                        const Tensor& weight,
+                        Tensor& out,
+                        aclrtStream stream) {
+    if (x.dtype() != DType::Float16 || weight.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("linear_causal_conv requires fp16 tensors");
+    }
+    if (x.shape().size() != 2 || out.shape() != x.shape()) {
+        throw std::runtime_error("linear_causal_conv x/out must be same [T, C] shape");
+    }
+    if (!((weight.shape().size() == 2 && weight.shape()[0] == x.shape()[1] && weight.shape()[1] == 4) ||
+          (weight.shape().size() == 3 && weight.shape()[0] == x.shape()[1] && weight.shape()[1] == 1 && weight.shape()[2] == 4))) {
+        throw std::runtime_error("linear_causal_conv weight must be [C,4] or [C,1,4]");
+    }
+
+    AclTensorHandle hx, hw, ho;
+    make_acl_tensor(x, hx);
+    make_acl_tensor(out, ho);
+
+    if (weight.shape().size() == 2) {
+        make_acl_tensor(weight, hw);
+    } else {
+        hw.storage_dims = weight.shape();
+        hw.view_dims = {weight.shape()[0], weight.shape()[2]};
+        hw.strides = {weight.shape()[2], 1};
+        hw.tensor = aclCreateTensor(
+            hw.view_dims.data(), hw.view_dims.size(), to_acl_dtype(weight.dtype()),
+            hw.strides.data(), 0, ACL_FORMAT_ND,
+            hw.storage_dims.data(), hw.storage_dims.size(),
+            weight.data());
+        if (hw.tensor == nullptr) {
+            throw std::runtime_error("aclCreateTensor returned null for linear_causal_conv weight view");
+        }
+    }
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnLinearCausalConvCustomGetWorkspaceSize(hx.tensor, hw.tensor, ho.tensor,
+                                                           &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnLinearCausalConvCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnLinearCausalConvCustom", ws_size, executor, stream, aclnnLinearCausalConvCustom);
+}
+
+void linear_gated_delta_rule(const Tensor& mixed,
+                             const Tensor& beta,
+                             const Tensor& decay,
+                             Tensor& scratch,
+                             Tensor& out,
+                             aclrtStream stream) {
+    if (mixed.dtype() != DType::Float16 || beta.dtype() != DType::Float16 ||
+        decay.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("linear_gated_delta_rule requires fp16 tensors");
+    }
+    if (scratch.dtype() != DType::Float32) {
+        throw std::runtime_error("linear_gated_delta_rule scratch must be fp32");
+    }
+    constexpr int64_t kScratchElems = 8 * (128 * 128 + 5 * 128);
+    if (scratch.shape().size() != 1 || scratch.shape()[0] != kScratchElems) {
+        throw std::runtime_error("linear_gated_delta_rule scratch must be [136192] fp32");
+    }
+    if (mixed.shape().size() != 2 || mixed.shape()[1] != 6144) {
+        throw std::runtime_error("linear_gated_delta_rule mixed shape must be [T, 6144]");
+    }
+    if (beta.shape().size() != 2 || beta.shape()[1] != 16 || beta.shape()[0] != mixed.shape()[0]) {
+        throw std::runtime_error("linear_gated_delta_rule beta shape must be [T, 16]");
+    }
+    if (decay.shape() != beta.shape()) {
+        throw std::runtime_error("linear_gated_delta_rule decay shape must match beta");
+    }
+    if (out.shape().size() != 2 || out.shape()[1] != 2048 || out.shape()[0] != mixed.shape()[0]) {
+        throw std::runtime_error("linear_gated_delta_rule out shape must be [T, 2048]");
+    }
+
+    AclTensorHandle hm, hb, hd, hs, ho;
+    make_acl_tensor(mixed, hm);
+    make_acl_tensor(beta, hb);
+    make_acl_tensor(decay, hd);
+    make_acl_tensor(scratch, hs);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnLinearGatedDeltaRuleCustomGetWorkspaceSize(hm.tensor, hb.tensor, hd.tensor, hs.tensor,
+                                                               ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnLinearGatedDeltaRuleCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnLinearGatedDeltaRuleCustom", ws_size, executor, stream, aclnnLinearGatedDeltaRuleCustom);
+}
+
+void linear_gated_delta_rule_step(const Tensor& mixed,
+                                  const Tensor& beta,
+                                  const Tensor& decay,
+                                  Tensor& state,
+                                  Tensor& scratch,
+                                  Tensor& out,
+                                  aclrtStream stream) {
+    if (mixed.dtype() != DType::Float16 || beta.dtype() != DType::Float16 ||
+        decay.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("linear_gated_delta_rule_step requires fp16 mixed/beta/decay/out");
+    }
+    if (state.dtype() != DType::Float32 || scratch.dtype() != DType::Float32) {
+        throw std::runtime_error("linear_gated_delta_rule_step state/scratch must be fp32");
+    }
+    if (mixed.shape() != std::vector<int64_t>{1, 6144}) {
+        throw std::runtime_error("linear_gated_delta_rule_step mixed must be [1, 6144]");
+    }
+    if (beta.shape() != std::vector<int64_t>{1, 16}) {
+        throw std::runtime_error("linear_gated_delta_rule_step beta must be [1, 16]");
+    }
+    if (decay.shape() != std::vector<int64_t>{1, 16}) {
+        throw std::runtime_error("linear_gated_delta_rule_step decay must be [1, 16]");
+    }
+    if (state.shape() != std::vector<int64_t>{16, 128, 128}) {
+        throw std::runtime_error("linear_gated_delta_rule_step state must be [16, 128, 128] fp32");
+    }
+    constexpr int64_t kScratchElems = 8 * 5 * 128;
+    if (scratch.shape().size() != 1 || scratch.shape()[0] != kScratchElems) {
+        throw std::runtime_error("linear_gated_delta_rule_step scratch must be [5120] fp32");
+    }
+    if (out.shape() != std::vector<int64_t>{1, 2048}) {
+        throw std::runtime_error("linear_gated_delta_rule_step out must be [1, 2048]");
+    }
+
+    AclTensorHandle hm, hb, hd, hstate, hscratch, ho;
+    make_acl_tensor(mixed, hm);
+    make_acl_tensor(beta, hb);
+    make_acl_tensor(decay, hd);
+    make_acl_tensor(state, hstate);
+    make_acl_tensor(scratch, hscratch);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnLinearGatedDeltaRuleStepCustomGetWorkspaceSize(hm.tensor, hb.tensor, hd.tensor,
+                                                                    hstate.tensor, hscratch.tensor,
+                                                                    ho.tensor,
+                                                                    &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnLinearGatedDeltaRuleStepCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnLinearGatedDeltaRuleStepCustom", ws_size, executor, stream, aclnnLinearGatedDeltaRuleStepCustom);
+}
+
+void gated_rms_norm_z(const Tensor& core,
+                      const Tensor& z_silu,
+                      const Tensor& gamma,
+                      Tensor& out,
+                      aclrtStream stream) {
+    if (core.dtype() != DType::Float16 || z_silu.dtype() != DType::Float16 ||
+        gamma.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("gated_rms_norm_z requires fp16 tensors");
+    }
+    if (core.shape().size() != 2 || core.shape()[1] != 2048) {
+        throw std::runtime_error("gated_rms_norm_z core shape must be [T, 2048]");
+    }
+    if (z_silu.shape() != core.shape()) {
+        throw std::runtime_error("gated_rms_norm_z z_silu shape must match core");
+    }
+    if (out.shape() != core.shape()) {
+        throw std::runtime_error("gated_rms_norm_z out shape must match core");
+    }
+    if (gamma.shape().size() != 1 || gamma.shape()[0] != 128) {
+        throw std::runtime_error("gated_rms_norm_z gamma shape must be [128]");
+    }
+
+    AclTensorHandle hc, hz, hg, ho;
+    make_acl_tensor(core, hc);
+    make_acl_tensor(z_silu, hz);
+    make_acl_tensor(gamma, hg);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnGatedRmsNormZCustomGetWorkspaceSize(hc.tensor, hz.tensor, hg.tensor,
+                                                        ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnGatedRmsNormZCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnGatedRmsNormZCustom", ws_size, executor, stream, aclnnGatedRmsNormZCustom);
 }
 
 }  // namespace minicpmv

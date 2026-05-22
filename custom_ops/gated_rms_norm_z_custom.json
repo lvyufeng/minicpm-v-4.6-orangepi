@@ -1,0 +1,12 @@
+{
+  "op": "GatedRmsNormZCustom",
+  "input_desc": [
+    {"name": "core", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "z_silu", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "gamma", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

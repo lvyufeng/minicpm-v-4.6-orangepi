@@ -95,6 +95,15 @@ int main() {
     for (int layer = 0; layer < 3; ++layer) {
         Tensor input_norm_w = load_layer_weight(index, layer, "input_layernorm.weight");
         Tensor post_norm_w = load_layer_weight(index, layer, "post_attention_layernorm.weight");
+        Tensor qkv_w = load_layer_weight(index, layer, "linear_attn.in_proj_qkv.weight");
+        Tensor z_w = load_layer_weight(index, layer, "linear_attn.in_proj_z.weight");
+        Tensor a_w = load_layer_weight(index, layer, "linear_attn.in_proj_a.weight");
+        Tensor b_w = load_layer_weight(index, layer, "linear_attn.in_proj_b.weight");
+        Tensor conv_w = load_layer_weight(index, layer, "linear_attn.conv1d.weight");
+        Tensor dt_bias_t = load_layer_weight(index, layer, "linear_attn.dt_bias");
+        Tensor a_log_t = load_layer_weight(index, layer, "linear_attn.A_log");
+        Tensor gated_norm_w = load_layer_weight(index, layer, "linear_attn.norm.weight");
+        Tensor out_proj_w = load_layer_weight(index, layer, "linear_attn.out_proj.weight");
         Tensor gate_w = load_layer_weight(index, layer, "mlp.gate_proj.weight");
         Tensor up_w = load_layer_weight(index, layer, "mlp.up_proj.weight");
         Tensor down_w = load_layer_weight(index, layer, "mlp.down_proj.weight");
@@ -102,11 +111,20 @@ int main() {
         LinearAttentionDecoderLayerWeights weights{
             &input_norm_w,
             &post_norm_w,
+            &qkv_w,
+            &z_w,
+            &a_w,
+            &b_w,
+            &conv_w,
+            &dt_bias_t,
+            &a_log_t,
+            &gated_norm_w,
+            &out_proj_w,
             &gate_w,
             &up_w,
             &down_w,
         };
-        linear_attention_decoder_layer_stub(hidden, weights, linear_config, next, ctx.stream());
+        linear_attention_decoder_layer(hidden, weights, linear_config, next, ctx.stream());
         copy_tensor(next, hidden, ctx.stream());
     }
 
@@ -166,7 +184,7 @@ int main() {
         return 1;
     }
 
-    std::cout << "decoder stack smoke ok layers=0,1,2(linear_stub),3(full)"
+    std::cout << "decoder stack smoke ok layers=0,1,2(linear_npu),3(full)"
               << " final=[" << next.shape()[0] << "," << next.shape()[1] << "]"
               << " first=" << first << std::endl;
     return 0;
