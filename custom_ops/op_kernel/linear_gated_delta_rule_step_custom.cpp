@@ -7,114 +7,181 @@ public:
     __aicore__ inline KernelLinearGatedDeltaRuleStepCustom() {}
 
     __aicore__ inline void Init(GM_ADDR mixed, GM_ADDR beta, GM_ADDR decay,
-                                GM_ADDR state, GM_ADDR scratch, GM_ADDR out) {
-        const int32_t blockIdx = static_cast<int32_t>(GetBlockIdx());
-        this->blockIdx = blockIdx;
-        mixedGm.SetGlobalBuffer((__gm__ half*)mixed, CONV_DIM_I);
-        betaGm.SetGlobalBuffer((__gm__ half*)beta, NUM_HEADS_I);
-        decayGm.SetGlobalBuffer((__gm__ half*)decay, NUM_HEADS_I);
-        outGm.SetGlobalBuffer((__gm__ half*)out, VALUE_DIM_I);
-        stateGm.SetGlobalBuffer((__gm__ float*)state, NUM_HEADS_I * STATE_ELEMS);
-        const int32_t scratchOffset = blockIdx * SCRATCH_PER_BLOCK;
-        qBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset, HEAD_DIM_I);
-        kBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + HEAD_DIM_I, HEAD_DIM_I);
-        vBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 2 * HEAD_DIM_I, HEAD_DIM_I);
-        kvBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 3 * HEAD_DIM_I, HEAD_DIM_I);
-        dBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 4 * HEAD_DIM_I, HEAD_DIM_I);
-        outFloatBuf.SetGlobalBuffer((__gm__ float*)scratch + scratchOffset + 5 * HEAD_DIM_I, HEAD_DIM_I);
+                                GM_ADDR state, GM_ADDR /*scratch*/, GM_ADDR out) {
+        const int32_t bIdx = static_cast<int32_t>(GetBlockIdx());
+        this->blockIdx = bIdx;
+        mixedGm.SetGlobalBuffer((__gm__ half*)mixed, CONV_DIM);
+        betaGm.SetGlobalBuffer((__gm__ half*)beta, NUM_HEADS);
+        decayGm.SetGlobalBuffer((__gm__ half*)decay, NUM_HEADS);
+        outGm.SetGlobalBuffer((__gm__ half*)out, VALUE_DIM);
+        stateGm.SetGlobalBuffer((__gm__ float*)state, NUM_HEADS * STATE_ELEMS);
+
+        // UB allocations. Total ~135 KiB / block; the 310B AICore UB is 256 KiB.
+        pipe.InitBuffer(stateBuf, HEADS_PER_BLOCK * STATE_ELEMS * sizeof(float));
+        pipe.InitBuffer(mixedFp16Buf, 3 * HEAD_DIM * sizeof(half));
+        pipe.InitBuffer(mixedFpBuf,   3 * HEAD_DIM * sizeof(float));
+        pipe.InitBuffer(kvBuf,        HEAD_DIM * sizeof(float));
+        pipe.InitBuffer(deltaBuf,     HEAD_DIM * sizeof(float));
+        pipe.InitBuffer(outFpBuf,     HEAD_DIM * sizeof(float));
+        pipe.InitBuffer(outFp16Buf,   HEAD_DIM * sizeof(half));
+        pipe.InitBuffer(normSrcBuf,   HEAD_DIM * sizeof(float));
+        pipe.InitBuffer(normTmpBuf,   HEAD_DIM * sizeof(float));
+        pipe.InitBuffer(normDstBuf,   32);  // ReduceSum dst slot
     }
 
     __aicore__ inline void Process() {
         const int32_t headStart = blockIdx * HEADS_PER_BLOCK;
-        const int32_t headEnd = headStart + HEADS_PER_BLOCK;
-        for (int32_t h = headStart; h < headEnd; ++h) {
-            const int32_t stateBase = h * STATE_ELEMS;
-            const int32_t qBase = h * HEAD_DIM_I;
-            const int32_t kBase = KEY_DIM_I + h * HEAD_DIM_I;
-            const int32_t vBase = 2 * KEY_DIM_I + h * HEAD_DIM_I;
 
-            // Load q, k, v into scratch as fp32, computing q/k l2 norms along the way.
-            float qNorm = 0.0f;
-            float kNorm = 0.0f;
-            for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                float qv = static_cast<float>(mixedGm.GetValue(qBase + i));
-                float kv = static_cast<float>(mixedGm.GetValue(kBase + i));
-                float vv = static_cast<float>(mixedGm.GetValue(vBase + i));
-                qBuf.SetValue(i, qv);
-                kBuf.SetValue(i, kv);
-                vBuf.SetValue(i, vv);
-                qNorm += qv * qv;
-                kNorm += kv * kv;
-            }
-            float qInv = 1.0f / sqrt(qNorm + EPSILON);
-            float kInv = 1.0f / sqrt(kNorm + EPSILON);
-            for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                qBuf.SetValue(i, qBuf.GetValue(i) * qInv * Q_SCALE);
-                kBuf.SetValue(i, kBuf.GetValue(i) * kInv);
+        LocalTensor<float> stateLocal = stateBuf.Get<float>();
+        LocalTensor<half>  mixedFp16  = mixedFp16Buf.Get<half>();
+        LocalTensor<float> mixedFp    = mixedFpBuf.Get<float>();
+        LocalTensor<float> kvLocal    = kvBuf.Get<float>();
+        LocalTensor<float> deltaLocal = deltaBuf.Get<float>();
+        LocalTensor<float> outFp      = outFpBuf.Get<float>();
+        LocalTensor<half>  outFp16    = outFp16Buf.Get<half>();
+        LocalTensor<float> normSrc    = normSrcBuf.Get<float>();
+        LocalTensor<float> normTmp    = normTmpBuf.Get<float>();
+        LocalTensor<float> normDst    = normDstBuf.Get<float>();
+
+        // Load this block's slice of the state matrix into UB once.
+        DataCopy(stateLocal, stateGm[headStart * STATE_ELEMS],
+                 HEADS_PER_BLOCK * STATE_ELEMS);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+
+        for (int32_t localH = 0; localH < HEADS_PER_BLOCK; ++localH) {
+            const int32_t h = headStart + localH;
+            LocalTensor<float> stateH = stateLocal[localH * STATE_ELEMS];
+
+            // ---- Load q, k, v for this head into mixedFp16 (fp16), then cast to fp32.
+            const int32_t qOff = h * HEAD_DIM;
+            const int32_t kOff = KEY_DIM + h * HEAD_DIM;
+            const int32_t vOff = 2 * KEY_DIM + h * HEAD_DIM;
+            DataCopy(mixedFp16[0 * HEAD_DIM], mixedGm[qOff], HEAD_DIM);
+            DataCopy(mixedFp16[1 * HEAD_DIM], mixedGm[kOff], HEAD_DIM);
+            DataCopy(mixedFp16[2 * HEAD_DIM], mixedGm[vOff], HEAD_DIM);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+
+            Cast(mixedFp, mixedFp16, RoundMode::CAST_NONE, 3 * HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+
+            LocalTensor<float> q = mixedFp[0];
+            LocalTensor<float> k = mixedFp[HEAD_DIM];
+            LocalTensor<float> v = mixedFp[2 * HEAD_DIM];
+
+            // ---- qNorm, kNorm via vectorized ReduceSum of (x * x).
+            Mul(normSrc, q, q, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            ReduceSum<float>(normDst, normSrc, normTmp, HEAD_DIM);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            const float qNorm = normDst.GetValue(0);
+
+            Mul(normSrc, k, k, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            ReduceSum<float>(normDst, normSrc, normTmp, HEAD_DIM);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            const float kNorm = normDst.GetValue(0);
+
+            const float qInv = Q_SCALE / sqrt(qNorm + EPSILON);
+            const float kInv = 1.0f / sqrt(kNorm + EPSILON);
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+
+            Muls(q, q, qInv, HEAD_DIM);
+            Muls(k, k, kInv, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+
+            // ---- Load beta, decay scalars (1 elem each; GetValue is fine here).
+            const float betaH  = static_cast<float>(betaGm.GetValue(h));
+            const float decayH = static_cast<float>(decayGm.GetValue(h));
+
+            // ---- Pass A: state *= decay (rowwise), kv = state^T . k.
+            Duplicate(kvLocal, 0.0f, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            for (int32_t i = 0; i < HEAD_DIM; ++i) {
+                LocalTensor<float> rowI = stateH[i * HEAD_DIM];
+                Muls(rowI, rowI, decayH, HEAD_DIM);
+                PipeBarrier<PIPE_V>();
+                SetFlag<HardEvent::V_S>(EVENT_ID0);
+                WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                const float ki = k.GetValue(i);
+                SetFlag<HardEvent::S_V>(EVENT_ID0);
+                WaitFlag<HardEvent::S_V>(EVENT_ID0);
+                Axpy<float, float>(kvLocal, rowI, ki, HEAD_DIM);
+                PipeBarrier<PIPE_V>();
             }
 
-            const float beta = static_cast<float>(betaGm.GetValue(h));
-            const float decay = static_cast<float>(decayGm.GetValue(h));
+            // ---- delta = (v - kv) * beta.
+            Sub(deltaLocal, v, kvLocal, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            Muls(deltaLocal, deltaLocal, betaH, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
 
-            // Pass A: apply decay, compute kv = state' . k, then delta = (v - kv) * beta.
-            // Each state element is read once and written once.
-            for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                kvBuf.SetValue(j, 0.0f);
-            }
-            for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                const float kVal = kBuf.GetValue(i);
-                const int32_t rowBase = stateBase + i * HEAD_DIM_I;
-                for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                    float s = stateGm.GetValue(rowBase + j) * decay;
-                    stateGm.SetValue(rowBase + j, s);
-                    kvBuf.SetValue(j, kvBuf.GetValue(j) + s * kVal);
-                }
-            }
-            for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                dBuf.SetValue(j, (vBuf.GetValue(j) - kvBuf.GetValue(j)) * beta);
-                outFloatBuf.SetValue(j, 0.0f);
+            // ---- Pass B: state[i] += k[i] * delta, then out += state[i] * q[i].
+            Duplicate(outFp, 0.0f, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            for (int32_t i = 0; i < HEAD_DIM; ++i) {
+                LocalTensor<float> rowI = stateH[i * HEAD_DIM];
+                SetFlag<HardEvent::V_S>(EVENT_ID0);
+                WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                const float ki = k.GetValue(i);
+                const float qi = q.GetValue(i);
+                SetFlag<HardEvent::S_V>(EVENT_ID0);
+                WaitFlag<HardEvent::S_V>(EVENT_ID0);
+                Axpy<float, float>(rowI, deltaLocal, ki, HEAD_DIM);
+                PipeBarrier<PIPE_V>();
+                Axpy<float, float>(outFp, rowI, qi, HEAD_DIM);
+                PipeBarrier<PIPE_V>();
             }
 
-            // Pass B: add outer(k, delta) into state and accumulate out = state_final . q.
-            for (int32_t i = 0; i < HEAD_DIM_I; ++i) {
-                const float kVal = kBuf.GetValue(i);
-                const float qVal = qBuf.GetValue(i);
-                const int32_t rowBase = stateBase + i * HEAD_DIM_I;
-                for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                    float s = stateGm.GetValue(rowBase + j) + kVal * dBuf.GetValue(j);
-                    stateGm.SetValue(rowBase + j, s);
-                    outFloatBuf.SetValue(j, outFloatBuf.GetValue(j) + s * qVal);
-                }
-            }
-            for (int32_t j = 0; j < HEAD_DIM_I; ++j) {
-                outGm.SetValue(h * HEAD_DIM_I + j, static_cast<half>(outFloatBuf.GetValue(j)));
-            }
+            // ---- Cast out to fp16 and write to GM.
+            Cast(outFp16, outFp, RoundMode::CAST_RINT, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            DataCopy(outGm[h * HEAD_DIM], outFp16, HEAD_DIM);
+            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
         }
+
+        // ---- Write the updated state back to GM.
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopy(stateGm[headStart * STATE_ELEMS], stateLocal,
+                 HEADS_PER_BLOCK * STATE_ELEMS);
     }
 
 private:
-    static constexpr int32_t NUM_HEADS_I = 16;
-    static constexpr int32_t HEAD_DIM_I = 128;
-    static constexpr int32_t KEY_DIM_I = 2048;
-    static constexpr int32_t VALUE_DIM_I = 2048;
-    static constexpr int32_t CONV_DIM_I = 6144;
-    static constexpr int32_t STATE_ELEMS = HEAD_DIM_I * HEAD_DIM_I;
+    static constexpr int32_t NUM_HEADS       = 16;
+    static constexpr int32_t HEAD_DIM        = 128;
+    static constexpr int32_t KEY_DIM         = NUM_HEADS * HEAD_DIM;
+    static constexpr int32_t VALUE_DIM       = NUM_HEADS * HEAD_DIM;
+    static constexpr int32_t CONV_DIM        = 2 * KEY_DIM + VALUE_DIM;
+    static constexpr int32_t STATE_ELEMS     = HEAD_DIM * HEAD_DIM;
     static constexpr int32_t HEADS_PER_BLOCK = 2;
-    static constexpr int32_t SCRATCH_PER_BLOCK = 6 * HEAD_DIM_I;
-    static constexpr float EPSILON = 0.000001f;
-    static constexpr float Q_SCALE = 0.08838834764831845f;
-    GlobalTensor<half> mixedGm;
-    GlobalTensor<half> betaGm;
-    GlobalTensor<half> decayGm;
-    GlobalTensor<half> outGm;
-    GlobalTensor<float> stateGm;
-    GlobalTensor<float> qBuf;
-    GlobalTensor<float> kBuf;
-    GlobalTensor<float> vBuf;
-    GlobalTensor<float> kvBuf;
-    GlobalTensor<float> dBuf;
-    GlobalTensor<float> outFloatBuf;
+    static constexpr float   EPSILON         = 0.000001f;
+    static constexpr float   Q_SCALE         = 0.08838834764831845f;
+
     int32_t blockIdx;
+    GlobalTensor<half>  mixedGm;
+    GlobalTensor<half>  betaGm;
+    GlobalTensor<half>  decayGm;
+    GlobalTensor<half>  outGm;
+    GlobalTensor<float> stateGm;
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> stateBuf;
+    TBuf<TPosition::VECCALC> mixedFp16Buf;
+    TBuf<TPosition::VECCALC> mixedFpBuf;
+    TBuf<TPosition::VECCALC> kvBuf;
+    TBuf<TPosition::VECCALC> deltaBuf;
+    TBuf<TPosition::VECCALC> outFpBuf;
+    TBuf<TPosition::VECCALC> outFp16Buf;
+    TBuf<TPosition::VECCALC> normSrcBuf;
+    TBuf<TPosition::VECCALC> normTmpBuf;
+    TBuf<TPosition::VECCALC> normDstBuf;
 };
 
 extern "C" __global__ __aicore__ void linear_gated_delta_rule_step_custom(GM_ADDR mixed,
