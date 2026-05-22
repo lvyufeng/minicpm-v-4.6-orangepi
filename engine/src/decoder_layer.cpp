@@ -107,6 +107,34 @@ void copy_heads_from_cols(const Tensor& src, int64_t heads, int64_t head_dim,
     check_acl(aclrtSynchronizeStream(stream), "copy_heads_from_cols sync");
 }
 
+void split_q_gate(const Tensor& src, int64_t heads, int64_t head_dim,
+                  Tensor& q_out, Tensor& gate_out, aclrtStream stream) {
+    const int64_t rows = src.shape()[0];
+    const size_t elem = dtype_size(src.dtype());
+    const size_t src_row_bytes = static_cast<size_t>(src.shape()[1]) * elem;
+    const size_t head_bytes = static_cast<size_t>(head_dim) * elem;
+    const size_t q_row_bytes = static_cast<size_t>(q_out.shape()[1]) * elem;
+    auto* s = static_cast<const uint8_t*>(src.data());
+    auto* dq = static_cast<uint8_t*>(q_out.data());
+    auto* dg = static_cast<uint8_t*>(gate_out.data());
+    for (int64_t t = 0; t < rows; ++t) {
+        for (int64_t h = 0; h < heads; ++h) {
+            const size_t src_off = static_cast<size_t>(t) * src_row_bytes
+                                 + static_cast<size_t>(h * 2 * head_dim) * elem;
+            const size_t dst_off = static_cast<size_t>(t) * q_row_bytes
+                                 + static_cast<size_t>(h * head_dim) * elem;
+            check_acl(aclrtMemcpyAsync(dq + dst_off, head_bytes, s + src_off, head_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                      "split_q_gate q");
+            check_acl(aclrtMemcpyAsync(dg + dst_off, head_bytes, s + src_off + head_bytes, head_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                      "split_q_gate gate");
+        }
+    }
+    check_acl(aclrtSynchronizeStream(stream), "split_q_gate sync");
+}
+
+
 void pack_heads_to_row(const Tensor& src_heads, Tensor& dst_row, int64_t heads,
                        int64_t head_dim, aclrtStream stream) {
     const size_t elem = dtype_size(src_heads.dtype());
@@ -244,9 +272,13 @@ void full_attention_decoder_layer(const Tensor& hidden,
     matmul_b_transposed(normed, *weights.k_proj_weight, k_full, stream);
     matmul_b_transposed(normed, *weights.v_proj_weight, v_full, stream);
 
+    Tensor q_only({T, QMainDim}, DType::Float16); q_only.allocate();
+    Tensor q_gate({T, QMainDim}, DType::Float16); q_gate.allocate();
+    split_q_gate(q_full, NumQHeads, HeadDim, q_only, q_gate, stream);
+
     Tensor q_heads({T * NumQHeads, HeadDim}, DType::Float16); q_heads.allocate();
     Tensor k_heads({T * NumKVHeads, HeadDim}, DType::Float16); k_heads.allocate();
-    copy_heads_from_cols(q_full, NumQHeads, HeadDim, q_heads, stream);
+    copy_heads_from_cols(q_only, NumQHeads, HeadDim, q_heads, stream);
     copy_heads_from_cols(k_full, NumKVHeads, HeadDim, k_heads, stream);
 
     Tensor q_normed({T * NumQHeads, HeadDim}, DType::Float16); q_normed.allocate();
@@ -302,7 +334,13 @@ void full_attention_decoder_layer(const Tensor& hidden,
     }
 
     Tensor attn_proj({T, Hidden}, DType::Float16); attn_proj.allocate();
-    matmul_b_transposed(attn_out, *weights.o_proj_weight, attn_proj, stream);
+    {
+        Tensor gate_sig({T, QMainDim}, DType::Float16); gate_sig.allocate();
+        sigmoid(q_gate, gate_sig, stream);
+        Tensor attn_gated({T, QMainDim}, DType::Float16); attn_gated.allocate();
+        mul(attn_out, gate_sig, attn_gated, stream);
+        matmul_b_transposed(attn_gated, *weights.o_proj_weight, attn_proj, stream);
+    }
 
     Tensor after_attn({T, Hidden}, DType::Float16); after_attn.allocate();
     add(hidden, attn_proj, after_attn, stream);
@@ -631,9 +669,13 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     matmul_b_transposed(normed, *weights.k_proj_weight, k_full, stream);
     matmul_b_transposed(normed, *weights.v_proj_weight, v_full, stream);
 
+    Tensor q_only({1, QMainDim}, DType::Float16); q_only.allocate();
+    Tensor q_gate({1, QMainDim}, DType::Float16); q_gate.allocate();
+    split_q_gate(q_full, NumQHeads, HeadDim, q_only, q_gate, stream);
+
     Tensor q_heads({NumQHeads, HeadDim}, DType::Float16); q_heads.allocate();
     Tensor k_heads({NumKVHeads, HeadDim}, DType::Float16); k_heads.allocate();
-    copy_heads_from_cols(q_full, NumQHeads, HeadDim, q_heads, stream);
+    copy_heads_from_cols(q_only, NumQHeads, HeadDim, q_heads, stream);
     copy_heads_from_cols(k_full, NumKVHeads, HeadDim, k_heads, stream);
 
     Tensor q_normed({NumQHeads, HeadDim}, DType::Float16); q_normed.allocate();
@@ -679,7 +721,13 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     }
 
     Tensor attn_proj({1, Hidden}, DType::Float16); attn_proj.allocate();
-    matmul_b_transposed(attn_out, *weights.o_proj_weight, attn_proj, stream);
+    {
+        Tensor gate_sig({1, QMainDim}, DType::Float16); gate_sig.allocate();
+        sigmoid(q_gate, gate_sig, stream);
+        Tensor attn_gated({1, QMainDim}, DType::Float16); attn_gated.allocate();
+        mul(attn_out, gate_sig, attn_gated, stream);
+        matmul_b_transposed(attn_gated, *weights.o_proj_weight, attn_proj, stream);
+    }
 
     Tensor after_attn({1, Hidden}, DType::Float16); after_attn.allocate();
     add(hidden, attn_proj, after_attn, stream);

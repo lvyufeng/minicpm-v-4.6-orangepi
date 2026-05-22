@@ -26,6 +26,8 @@ void mul(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream);
 
 void silu(const Tensor& self, Tensor& out, aclrtStream stream);
 
+void sigmoid(const Tensor& self, Tensor& out, aclrtStream stream);
+
 void softmax_last_dim(const Tensor& self, Tensor& out, aclrtStream stream);
 
 void rms_norm1024(const Tensor& x, const Tensor& gamma, Tensor& out,

@@ -10,6 +10,7 @@
 #include <aclnnop/aclnn_add.h>
 #include <aclnnop/aclnn_mul.h>
 #include <aclnnop/aclnn_silu.h>
+#include <aclnnop/aclnn_sigmoid.h>
 #include <aclnnop/aclnn_softmax.h>
 #include <aclnnop/aclnn_layer_norm.h>
 #include <aclnnop/aclnn_cast.h>
@@ -308,6 +309,18 @@ void silu(const Tensor& self, Tensor& out, aclrtStream stream) {
     run_op("aclnnSilu", ws_size, executor, stream, aclnnSilu);
 }
 
+void sigmoid(const Tensor& self, Tensor& out, aclrtStream stream) {
+    check_same_shape(self, out, "sigmoid");
+    AclTensorHandle hs, ho;
+    make_acl_tensor(self, hs);
+    make_acl_tensor(out, ho);
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnSigmoidGetWorkspaceSize(hs.tensor, ho.tensor, &ws_size, &executor);
+    if (ret != 0) throw std::runtime_error("aclnnSigmoidGetWorkspaceSize failed: " + std::to_string(ret));
+    run_op("aclnnSigmoid", ws_size, executor, stream, aclnnSigmoid);
+}
+
 void softmax_last_dim(const Tensor& self, Tensor& out, aclrtStream stream) {
     check_same_shape(self, out, "softmax");
     if (self.shape().empty()) throw std::runtime_error("softmax input must have rank >= 1");
@@ -479,17 +492,50 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         run_op("rms_norm Mul(x,rstd)", ws_size, executor, stream, aclnnMul);
     }
 
-    // 5) out = scaled * gamma (broadcast last dim)
+    // 5) out = scaled * (1 + gamma) (broadcast last dim)
     {
-        AclTensorHandle hscaled, hgamma, hout;
-        make_acl_tensor(scaled, hscaled);
-        make_acl_tensor(gamma, hgamma);
-        make_acl_tensor(out, hout);
+        Tensor gamma_plus_one(gamma.shape(), gamma.dtype());
+        gamma_plus_one.allocate();
+        AclTensorHandle hg_in, hg_out;
+        make_acl_tensor(gamma, hg_in);
+        make_acl_tensor(gamma_plus_one, hg_out);
+        float one_f = 1.0f;
+        aclScalar* one_scalar = aclCreateScalar(&one_f, ACL_FLOAT);
+        if (one_scalar == nullptr) throw std::runtime_error("rms_norm aclCreateScalar(1) failed");
+        float alpha_f = 1.0f;
+        aclScalar* alpha_scalar = aclCreateScalar(&alpha_f, ACL_FLOAT);
+        if (alpha_scalar == nullptr) {
+            aclDestroyScalar(one_scalar);
+            throw std::runtime_error("rms_norm aclCreateScalar(alpha) failed");
+        }
         uint64_t ws_size = 0;
         aclOpExecutor* executor = nullptr;
-        auto ret = aclnnMulGetWorkspaceSize(hscaled.tensor, hgamma.tensor, hout.tensor, &ws_size, &executor);
-        if (ret != 0) throw std::runtime_error("rms_norm Mul(*,gamma) ws failed: " + std::to_string(ret));
-        run_op("rms_norm Mul(*,gamma)", ws_size, executor, stream, aclnnMul);
+        auto ret = aclnnAddsGetWorkspaceSize(hg_in.tensor, one_scalar, alpha_scalar,
+                                             hg_out.tensor, &ws_size, &executor);
+        if (ret != 0) {
+            aclDestroyScalar(one_scalar);
+            aclDestroyScalar(alpha_scalar);
+            throw std::runtime_error("rms_norm Adds(gamma,1) ws failed: " + std::to_string(ret));
+        }
+        try {
+            run_op("rms_norm Adds(gamma,1)", ws_size, executor, stream, aclnnAdds);
+        } catch (...) {
+            aclDestroyScalar(one_scalar);
+            aclDestroyScalar(alpha_scalar);
+            throw;
+        }
+        aclDestroyScalar(one_scalar);
+        aclDestroyScalar(alpha_scalar);
+
+        AclTensorHandle hscaled, hgo, hout;
+        make_acl_tensor(scaled, hscaled);
+        make_acl_tensor(gamma_plus_one, hgo);
+        make_acl_tensor(out, hout);
+        uint64_t ws_size2 = 0;
+        aclOpExecutor* executor2 = nullptr;
+        auto ret2 = aclnnMulGetWorkspaceSize(hscaled.tensor, hgo.tensor, hout.tensor, &ws_size2, &executor2);
+        if (ret2 != 0) throw std::runtime_error("rms_norm Mul(*,1+gamma) ws failed: " + std::to_string(ret2));
+        run_op("rms_norm Mul(*,1+gamma)", ws_size2, executor2, stream, aclnnMul);
     }
 }
 
