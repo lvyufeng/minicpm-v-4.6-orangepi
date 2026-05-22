@@ -401,8 +401,7 @@ void run_full_attention_core(const Tensor& hidden,
 
     matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
     matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu(gate, gate_act, stream);
-    mul(gate_act, up, gated, stream);
+    silu_mul(gate, up, gated, stream);
     matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
@@ -480,8 +479,7 @@ void linear_attention_decoder_layer_stub(const Tensor& hidden,
 
     matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
     matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu(gate, gate_act, stream);
-    mul(gate_act, up, gated, stream);
+    silu_mul(gate, up, gated, stream);
     matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
@@ -649,8 +647,7 @@ void linear_attention_decoder_layer(const Tensor& hidden,
 
     matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
     matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu(gate, gate_act, stream);
-    mul(gate_act, up, gated_mlp, stream);
+    silu_mul(gate, up, gated_mlp, stream);
     matmul_b_transposed(gated_mlp, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
@@ -781,8 +778,7 @@ void linear_attention_decoder_layer_with_cache(const Tensor& hidden,
 
     matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
     matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu(gate, gate_act, stream);
-    mul(gate_act, up, gated_mlp, stream);
+    silu_mul(gate, up, gated_mlp, stream);
     matmul_b_transposed(gated_mlp, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 
@@ -908,30 +904,12 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     copy_tensor_to_cache_row(k_row, cache.k_cache, cache_len, stream);
     copy_tensor_to_cache_row(v_full, cache.v_cache, cache_len, stream);
 
-    Tensor scale({1, Context}, DType::Float16);
-    std::vector<uint16_t> scale_host(static_cast<size_t>(Context), f32_to_f16_bits(1.0f / std::sqrt(static_cast<float>(HeadDim))));
-    scale.copy_from_host(scale_host.data(), scale_host.size() * sizeof(uint16_t));
-
     Tensor attn_out({1, QMainDim}, DType::Float16); attn_out.allocate();
-    Tensor q_seq({1, HeadDim}, DType::Float16); q_seq.allocate();
-    Tensor k_seq({Context, HeadDim}, DType::Float16); k_seq.allocate();
-    Tensor v_seq({Context, HeadDim}, DType::Float16); v_seq.allocate();
-    Tensor scores({1, Context}, DType::Float16); scores.allocate();
-    Tensor scaled_scores({1, Context}, DType::Float16); scaled_scores.allocate();
-    Tensor probs({1, Context}, DType::Float16); probs.allocate();
-    Tensor ctx_seq({1, HeadDim}, DType::Float16); ctx_seq.allocate();
-
-    for (int64_t qh = 0; qh < NumQHeads; ++qh) {
-        const int64_t kvh = qh / QPerKV;
-        copy_head_to_seq(q_rope, qh, NumQHeads, q_seq, stream);
-        copy_cache_head_to_seq(cache.k_cache, kvh, NumKVHeads, HeadDim, Context, k_seq, stream);
-        copy_cache_head_to_seq(cache.v_cache, kvh, NumKVHeads, HeadDim, Context, v_seq, stream);
-        matmul_b_transposed(q_seq, k_seq, scores, stream);
-        mul(scores, scale, scaled_scores, stream);
-        softmax_last_dim(scaled_scores, probs, stream);
-        matmul(probs, v_seq, ctx_seq, stream);
-        copy_seq_to_head_block(ctx_seq, attn_out, qh * HeadDim, stream);
-    }
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(HeadDim));
+    incre_flash_attention(q_rope, cache.k_cache, cache.v_cache,
+                          Context, NumQHeads, NumKVHeads, HeadDim,
+                          attn_scale, attn_out, stream);
+    (void)QPerKV;
 
     Tensor attn_proj({1, Hidden}, DType::Float16); attn_proj.allocate();
     {
@@ -956,8 +934,7 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
 
     matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
     matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu(gate, gate_act, stream);
-    mul(gate_act, up, gated, stream);
+    silu_mul(gate, up, gated, stream);
     matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
@@ -1076,8 +1053,7 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
 
     matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
     matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu(gate, gate_act, stream);
-    mul(gate_act, up, gated_mlp, stream);
+    silu_mul(gate, up, gated_mlp, stream);
     matmul_b_transposed(gated_mlp, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }

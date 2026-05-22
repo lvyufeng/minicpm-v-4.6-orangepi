@@ -22,6 +22,8 @@
 #include "aclnn_linear_gated_delta_rule_custom.h"
 #include "aclnn_linear_gated_delta_rule_step_custom.h"
 #include "aclnn_gated_rms_norm_z_custom.h"
+#include "aclnn_attention_step_custom.h"
+#include "aclnn_silu_mul_custom.h"
 
 namespace minicpmv {
 
@@ -256,6 +258,77 @@ void check_same_shape(const Tensor& a, const Tensor& b, const char* op) {
 }
 
 }  // namespace
+
+void incre_flash_attention(const Tensor& query,
+                           const Tensor& k_cache,
+                           const Tensor& v_cache,
+                           int64_t context,
+                           int64_t num_q_heads,
+                           int64_t num_kv_heads,
+                           int64_t head_dim,
+                           float scale,
+                           Tensor& out,
+                           aclrtStream stream) {
+    if (query.dtype() != DType::Float16 || k_cache.dtype() != DType::Float16 ||
+        v_cache.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("incre_flash_attention requires fp16 tensors");
+    }
+    if (query.numel() != static_cast<size_t>(num_q_heads * head_dim)) {
+        throw std::runtime_error("incre_flash_attention query numel mismatch");
+    }
+    if (out.numel() != static_cast<size_t>(num_q_heads * head_dim)) {
+        throw std::runtime_error("incre_flash_attention out numel mismatch");
+    }
+    if (k_cache.shape().size() != 2 || k_cache.shape()[1] != num_kv_heads * head_dim) {
+        throw std::runtime_error("incre_flash_attention k_cache shape mismatch");
+    }
+    if (v_cache.shape() != k_cache.shape()) {
+        throw std::runtime_error("incre_flash_attention v_cache shape mismatch");
+    }
+    if (context <= 0 || context > k_cache.shape()[0]) {
+        throw std::runtime_error("incre_flash_attention context out of range");
+    }
+
+    // Our custom op AttentionStepCustom: one block per q-head, computes
+    // softmax(q · K_kvh^T * scale) · V_kvh and writes into out.
+    AclTensorHandle hq, hk, hv, ho;
+    make_acl_tensor(query, hq);
+    make_acl_tensor(k_cache, hk);
+    make_acl_tensor(v_cache, hv);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnAttentionStepCustomGetWorkspaceSize(
+        hq.tensor, hk.tensor, hv.tensor,
+        context, num_q_heads, num_kv_heads, static_cast<double>(scale),
+        ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnAttentionStepCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnAttentionStepCustom", ws_size, executor, stream, aclnnAttentionStepCustom);
+}
+
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, aclrtStream stream) {
+    if (gate.dtype() != DType::Float16 || up.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("silu_mul requires fp16 tensors");
+    }
+    if (gate.shape() != up.shape() || gate.shape() != out.shape()) {
+        throw std::runtime_error("silu_mul shape mismatch");
+    }
+    AclTensorHandle hg, hu, ho;
+    make_acl_tensor(gate, hg);
+    make_acl_tensor(up, hu);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnSiluMulCustomGetWorkspaceSize(hg.tensor, hu.tensor, ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnSiluMulCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnSiluMulCustom", ws_size, executor, stream, aclnnSiluMulCustom);
+}
 
 void add(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream) {
     check_same_shape(a, b, "add");

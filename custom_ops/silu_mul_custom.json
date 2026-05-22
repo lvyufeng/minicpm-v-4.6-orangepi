@@ -1,0 +1,11 @@
+{
+  "op": "SiluMulCustom",
+  "input_desc": [
+    {"name": "gate", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "up",   "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

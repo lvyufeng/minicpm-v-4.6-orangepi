@@ -20,6 +20,26 @@ void matmul_b_transposed(const Tensor& a, const Tensor& b, Tensor& out, aclrtStr
 
 void argmax_last_dim(const Tensor& self, Tensor& out, aclrtStream stream);
 
+// Incremental flash attention for single-token decode.
+// query: fp16 [num_q_heads, head_dim]  (the new token's post-RoPE Q, packed)
+// k_cache, v_cache: fp16 [max_seq, num_kv_heads * head_dim]  (rows [0, context) valid)
+// out: fp16 [1, num_q_heads * head_dim]
+// Calls aclnnIncreFlashAttention with BSND layout views.
+void incre_flash_attention(const Tensor& query,
+                           const Tensor& k_cache,
+                           const Tensor& v_cache,
+                           int64_t context,
+                           int64_t num_q_heads,
+                           int64_t num_kv_heads,
+                           int64_t head_dim,
+                           float scale,
+                           Tensor& out,
+                           aclrtStream stream);
+
+// Fused SwiGLU activation: out = silu(gate) * up.
+// gate, up, out: fp16 same shape.
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, aclrtStream stream);
+
 void add(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream);
 
 void mul(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream);

@@ -1,0 +1,17 @@
+{
+  "op": "AttentionStepCustom",
+  "input_desc": [
+    {"name": "query",   "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "k_cache", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "v_cache", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": [
+    {"name": "context",      "type": "int",   "param_type": "required"},
+    {"name": "num_q_heads",  "type": "int",   "param_type": "required"},
+    {"name": "num_kv_heads", "type": "int",   "param_type": "required"},
+    {"name": "scale",        "type": "float", "param_type": "required"}
+  ]
+}
