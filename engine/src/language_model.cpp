@@ -187,24 +187,44 @@ Tensor prefill_from_embeddings(const Tensor& prompt_hidden,
         throw std::runtime_error("prefill_from_embeddings cos_table too short");
     }
 
-    Tensor hidden({1, cfg.hidden_size}, DType::Float16); hidden.allocate();
-    Tensor next({1, cfg.hidden_size}, DType::Float16); next.allocate();
+    Tensor hidden({T, cfg.hidden_size}, DType::Float16); hidden.allocate();
+    Tensor next({T, cfg.hidden_size}, DType::Float16); next.allocate();
+    copy_tensor(prompt_hidden, hidden, stream);
 
-    for (int64_t t = 0; t < T; ++t) {
-        copy_row(prompt_hidden, t, hidden, 0, stream);
-        int full_i = 0;
-        int linear_i = 0;
-        for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
-            run_layer_step(layer, w, cfg, cos_table, sin_table,
-                           static_cast<int32_t>(t), state.seq_len,
-                           state, full_i, linear_i, hidden, next, stream);
-            copy_tensor(next, hidden, stream);
+    std::vector<int32_t> row_to_t(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) row_to_t[t] = static_cast<int32_t>(t);
+
+    LinearAttentionDecoderLayerConfig lcfg{cfg.rms_epsilon};
+    FullAttentionDecoderLayerConfig fcfg{cfg.num_q_heads, cfg.num_kv_heads,
+                                         cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon};
+
+    int full_i = 0;
+    int linear_i = 0;
+    for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
+        const auto& lw = w.layers[layer];
+        if (cfg.layer_types[layer] == "linear_attention") {
+            LinearAttentionDecoderLayerWeights ww{
+                &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
+                &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
+                &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+            };
+            linear_attention_decoder_layer_with_cache(hidden, ww, lcfg, state.linear[linear_i], next, stream);
+            ++linear_i;
+        } else {
+            FullAttentionDecoderLayerWeights ww{
+                &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
+                &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+            };
+            full_attention_decoder_layer_with_cache(hidden, ww, cos_table, sin_table,
+                                                    row_to_t, fcfg, state.full[full_i], next, stream);
+            ++full_i;
         }
-        ++state.seq_len;
+        copy_tensor(next, hidden, stream);
     }
+    state.seq_len = T;
 
     Tensor last_hidden({1, cfg.hidden_size}, DType::Float16); last_hidden.allocate();
-    copy_tensor(hidden, last_hidden, stream);
+    copy_row(hidden, T - 1, last_hidden, 0, stream);
     return last_hidden;
 }
 

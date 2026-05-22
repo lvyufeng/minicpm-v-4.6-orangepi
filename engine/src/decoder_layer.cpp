@@ -3,6 +3,7 @@
 #include "minicpmv/acl_context.h"
 #include "minicpmv/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -224,14 +225,18 @@ void validate_shapes(const Tensor& hidden,
 
 }  // namespace
 
-void full_attention_decoder_layer(const Tensor& hidden,
-                                  const FullAttentionDecoderLayerWeights& weights,
-                                  const Tensor& cos_table,
-                                  const Tensor& sin_table,
-                                  const std::vector<int32_t>& row_to_t,
-                                  const FullAttentionDecoderLayerConfig& config,
-                                  Tensor& out,
-                                  aclrtStream stream) {
+namespace {
+
+void run_full_attention_core(const Tensor& hidden,
+                             const FullAttentionDecoderLayerWeights& weights,
+                             const Tensor& cos_table,
+                             const Tensor& sin_table,
+                             const std::vector<int32_t>& row_to_t,
+                             const FullAttentionDecoderLayerConfig& config,
+                             FullAttentionLayerCache* cache,
+                             int64_t cache_offset,
+                             Tensor& out,
+                             aclrtStream stream) {
     validate_shapes(hidden, weights, config, out);
 
     const int64_t T = hidden.shape()[0];
@@ -260,6 +265,14 @@ void full_attention_decoder_layer(const Tensor& hidden,
     }
     if (static_cast<int64_t>(row_to_t.size()) != T) {
         throw std::runtime_error("decoder layer row_to_t size must match sequence length");
+    }
+    if (cache != nullptr) {
+        if (cache->k_cache.shape()[1] != KVDim || cache->v_cache.shape()[1] != KVDim) {
+            throw std::runtime_error("full attention cache KV dim mismatch");
+        }
+        if (cache_offset + T > cache->k_cache.shape()[0]) {
+            throw std::runtime_error("full attention cache overflow");
+        }
     }
 
     Tensor normed({T, Hidden}, DType::Float16); normed.allocate();
@@ -296,6 +309,38 @@ void full_attention_decoder_layer(const Tensor& hidden,
     Tensor k_rope({T * NumKVHeads, HeadDim}, DType::Float16); k_rope.allocate();
     apply_rope_partial(q_normed, cos_table, sin_table, q_row_to_t, config.rotary_dim, q_rope, stream);
     apply_rope_partial(k_normed, cos_table, sin_table, k_row_to_t, config.rotary_dim, k_rope, stream);
+
+    if (cache != nullptr) {
+        // Pack k_rope [T*NumKVHeads, HeadDim] back to [T, KVDim] then write rows [cache_offset, cache_offset+T).
+        const size_t elem = dtype_size(k_rope.dtype());
+        const size_t head_bytes = static_cast<size_t>(HeadDim) * elem;
+        const size_t row_bytes = static_cast<size_t>(KVDim) * elem;
+        auto* src = static_cast<const uint8_t*>(k_rope.data());
+        auto* dst = static_cast<uint8_t*>(cache->k_cache.data());
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t h = 0; h < NumKVHeads; ++h) {
+                check_acl(aclrtMemcpyAsync(dst + static_cast<size_t>(cache_offset + t) * row_bytes
+                                               + static_cast<size_t>(h) * head_bytes,
+                                           head_bytes,
+                                           src + static_cast<size_t>(t * NumKVHeads + h) * head_bytes,
+                                           head_bytes,
+                                           ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                          "k_rope -> k_cache");
+            }
+        }
+        // v_full is already [T, KVDim]; copy rows directly.
+        auto* vs = static_cast<const uint8_t*>(v_full.data());
+        auto* vd = static_cast<uint8_t*>(cache->v_cache.data());
+        for (int64_t t = 0; t < T; ++t) {
+            check_acl(aclrtMemcpyAsync(vd + static_cast<size_t>(cache_offset + t) * row_bytes,
+                                       row_bytes,
+                                       vs + static_cast<size_t>(t) * row_bytes,
+                                       row_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                      "v_full -> v_cache");
+        }
+        check_acl(aclrtSynchronizeStream(stream), "kv cache write sync");
+    }
 
     Tensor scale({T, T}, DType::Float16);
     std::vector<uint16_t> scale_host(static_cast<size_t>(T * T), f32_to_f16_bits(1.0f / std::sqrt(static_cast<float>(HeadDim))));
@@ -360,6 +405,33 @@ void full_attention_decoder_layer(const Tensor& hidden,
     mul(gate_act, up, gated, stream);
     matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
+}
+
+}  // namespace
+
+void full_attention_decoder_layer(const Tensor& hidden,
+                                  const FullAttentionDecoderLayerWeights& weights,
+                                  const Tensor& cos_table,
+                                  const Tensor& sin_table,
+                                  const std::vector<int32_t>& row_to_t,
+                                  const FullAttentionDecoderLayerConfig& config,
+                                  Tensor& out,
+                                  aclrtStream stream) {
+    run_full_attention_core(hidden, weights, cos_table, sin_table, row_to_t, config,
+                            nullptr, 0, out, stream);
+}
+
+void full_attention_decoder_layer_with_cache(const Tensor& hidden,
+                                             const FullAttentionDecoderLayerWeights& weights,
+                                             const Tensor& cos_table,
+                                             const Tensor& sin_table,
+                                             const std::vector<int32_t>& row_to_t,
+                                             const FullAttentionDecoderLayerConfig& config,
+                                             FullAttentionLayerCache& cache,
+                                             Tensor& out,
+                                             aclrtStream stream) {
+    run_full_attention_core(hidden, weights, cos_table, sin_table, row_to_t, config,
+                            &cache, 0, out, stream);
 }
 
 void linear_attention_decoder_layer_stub(const Tensor& hidden,
@@ -581,6 +653,147 @@ void linear_attention_decoder_layer(const Tensor& hidden,
     mul(gate_act, up, gated_mlp, stream);
     matmul_b_transposed(gated_mlp, *weights.down_proj_weight, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
+}
+
+void linear_attention_decoder_layer_with_cache(const Tensor& hidden,
+                                               const LinearAttentionDecoderLayerWeights& weights,
+                                               const LinearAttentionDecoderLayerConfig& config,
+                                               LinearAttentionLayerCache& cache,
+                                               Tensor& out,
+                                               aclrtStream stream) {
+    check_ptr(weights.input_norm_weight, "linear input_norm_weight");
+    check_ptr(weights.post_attention_norm_weight, "linear post_attention_norm_weight");
+    check_ptr(weights.in_proj_qkv_weight, "linear in_proj_qkv_weight");
+    check_ptr(weights.in_proj_z_weight, "linear in_proj_z_weight");
+    check_ptr(weights.in_proj_a_weight, "linear in_proj_a_weight");
+    check_ptr(weights.in_proj_b_weight, "linear in_proj_b_weight");
+    check_ptr(weights.conv1d_weight, "linear conv1d_weight");
+    check_ptr(weights.dt_bias, "linear dt_bias");
+    check_ptr(weights.a_log, "linear a_log");
+    check_ptr(weights.gated_norm_weight, "linear gated_norm_weight");
+    check_ptr(weights.out_proj_weight, "linear out_proj_weight");
+    check_ptr(weights.gate_proj_weight, "linear gate_proj_weight");
+    check_ptr(weights.up_proj_weight, "linear up_proj_weight");
+    check_ptr(weights.down_proj_weight, "linear down_proj_weight");
+
+    if (hidden.shape().size() != 2 || hidden.shape()[1] != 1024) {
+        throw std::runtime_error("linear decoder layer with_cache hidden must be [T, 1024]");
+    }
+    if (out.shape() != hidden.shape() || out.dtype() != DType::Float16 || hidden.dtype() != DType::Float16) {
+        throw std::runtime_error("linear decoder layer with_cache hidden/out must match shape and be fp16");
+    }
+    if (cache.conv_buf.shape() != std::vector<int64_t>{3, 6144} ||
+        cache.recurrent_state.shape() != std::vector<int64_t>{16, 128, 128}) {
+        throw std::runtime_error("linear decoder layer with_cache cache shape mismatch");
+    }
+
+    const int64_t T = hidden.shape()[0];
+    const int64_t Hidden = 1024;
+    const int64_t NumHeads = 16;
+    const int64_t HeadDim = 128;
+    const int64_t KeyDim = NumHeads * HeadDim;
+    const int64_t ValueDim = NumHeads * HeadDim;
+    const int64_t ConvDim = 2 * KeyDim + ValueDim;
+    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+
+    Tensor normed({T, Hidden}, DType::Float16); normed.allocate();
+    rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
+
+    Tensor qkv({T, ConvDim}, DType::Float16); qkv.allocate();
+    Tensor z({T, ValueDim}, DType::Float16); z.allocate();
+    Tensor a({T, NumHeads}, DType::Float16); a.allocate();
+    Tensor b({T, NumHeads}, DType::Float16); b.allocate();
+    matmul_b_transposed(normed, *weights.in_proj_qkv_weight, qkv, stream);
+    matmul_b_transposed(normed, *weights.in_proj_z_weight, z, stream);
+    matmul_b_transposed(normed, *weights.in_proj_a_weight, a, stream);
+    matmul_b_transposed(normed, *weights.in_proj_b_weight, b, stream);
+
+    Tensor conv({T, ConvDim}, DType::Float16); conv.allocate();
+    Tensor mixed({T, ConvDim}, DType::Float16); mixed.allocate();
+    linear_causal_conv(qkv, *weights.conv1d_weight, conv, stream);
+    silu(conv, mixed, stream);
+
+    std::vector<uint16_t> a_host(static_cast<size_t>(T) * NumHeads);
+    std::vector<uint16_t> b_host(static_cast<size_t>(T) * NumHeads);
+    std::vector<uint16_t> dt_host(NumHeads);
+    std::vector<uint16_t> a_log_host(NumHeads);
+    a.copy_to_host(a_host.data(), a_host.size() * sizeof(uint16_t));
+    b.copy_to_host(b_host.data(), b_host.size() * sizeof(uint16_t));
+    weights.dt_bias->copy_to_host(dt_host.data(), dt_host.size() * sizeof(uint16_t));
+    weights.a_log->copy_to_host(a_log_host.data(), a_log_host.size() * sizeof(uint16_t));
+
+    std::vector<uint16_t> beta_h(static_cast<size_t>(T) * NumHeads);
+    std::vector<uint16_t> decay_h(static_cast<size_t>(T) * NumHeads);
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t h = 0; h < NumHeads; ++h) {
+            float bv = h16_to_f32(b_host[t * NumHeads + h]);
+            float av = h16_to_f32(a_host[t * NumHeads + h]);
+            float dtv = h16_to_f32(dt_host[h]);
+            float alv = h16_to_f32(a_log_host[h]);
+            float g = -std::exp(alv) * softplus(av + dtv);
+            beta_h[t * NumHeads + h] = f32_to_f16_bits(sigmoid(bv));
+            decay_h[t * NumHeads + h] = f32_to_f16_bits(std::exp(g));
+        }
+    }
+
+    Tensor beta_dev({T, NumHeads}, DType::Float16);
+    Tensor decay_dev({T, NumHeads}, DType::Float16);
+    beta_dev.copy_from_host(beta_h.data(), beta_h.size() * sizeof(uint16_t));
+    decay_dev.copy_from_host(decay_h.data(), decay_h.size() * sizeof(uint16_t));
+
+    // Recurrence over T tokens, advancing cache.recurrent_state. Reuse per-step
+    // row tensors to avoid T allocations.
+    Tensor core_dev({T, ValueDim}, DType::Float16); core_dev.allocate();
+    Tensor mixed_row({1, ConvDim}, DType::Float16); mixed_row.allocate();
+    Tensor beta_row({1, NumHeads}, DType::Float16); beta_row.allocate();
+    Tensor decay_row({1, NumHeads}, DType::Float16); decay_row.allocate();
+    Tensor core_row({1, ValueDim}, DType::Float16); core_row.allocate();
+    Tensor step_scratch({8 * 6 * 128}, DType::Float32); step_scratch.allocate();
+    for (int64_t t = 0; t < T; ++t) {
+        copy_matrix_rows(mixed, t, mixed_row, 0, 1, stream);
+        copy_matrix_rows(beta_dev, t, beta_row, 0, 1, stream);
+        copy_matrix_rows(decay_dev, t, decay_row, 0, 1, stream);
+        linear_gated_delta_rule_step(mixed_row, beta_row, decay_row,
+                                     cache.recurrent_state, step_scratch, core_row, stream);
+        copy_matrix_rows(core_row, 0, core_dev, t, 1, stream);
+    }
+
+    Tensor z_silu({T, ValueDim}, DType::Float16); z_silu.allocate();
+    silu(z, z_silu, stream);
+
+    Tensor gated({T, ValueDim}, DType::Float16); gated.allocate();
+    gated_rms_norm_z(core_dev, z_silu, *weights.gated_norm_weight, gated, stream);
+
+    Tensor attn_proj({T, Hidden}, DType::Float16); attn_proj.allocate();
+    matmul_b_transposed(gated, *weights.out_proj_weight, attn_proj, stream);
+
+    Tensor after_attn({T, Hidden}, DType::Float16); after_attn.allocate();
+    add(hidden, attn_proj, after_attn, stream);
+
+    Tensor mlp_in({T, Hidden}, DType::Float16); mlp_in.allocate();
+    rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
+
+    Tensor gate({T, Intermediate}, DType::Float16); gate.allocate();
+    Tensor up({T, Intermediate}, DType::Float16); up.allocate();
+    Tensor gate_act({T, Intermediate}, DType::Float16); gate_act.allocate();
+    Tensor gated_mlp({T, Intermediate}, DType::Float16); gated_mlp.allocate();
+    Tensor mlp_out({T, Hidden}, DType::Float16); mlp_out.allocate();
+
+    matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
+    matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
+    silu(gate, gate_act, stream);
+    mul(gate_act, up, gated_mlp, stream);
+    matmul_b_transposed(gated_mlp, *weights.down_proj_weight, mlp_out, stream);
+    add(after_attn, mlp_out, out, stream);
+
+    // Update conv buffer with last min(T, 3) pre-conv qkv rows. With the
+    // documented "cache must start zero" precondition, leaving the first
+    // (3 - min(T,3)) rows untouched preserves the conv1d's implicit-zero-history
+    // semantics for the next decode step.
+    const int64_t copy_count = std::min<int64_t>(T, 3);
+    if (copy_count > 0) {
+        copy_matrix_rows(qkv, T - copy_count, cache.conv_buf, 3 - copy_count, copy_count, stream);
+    }
 }
 
 DecodeState make_decode_state(int64_t max_seq_len,

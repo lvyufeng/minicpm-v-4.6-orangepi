@@ -41,6 +41,21 @@ void full_attention_decoder_layer(const Tensor& hidden,
                                   Tensor& out,
                                   aclrtStream stream);
 
+struct FullAttentionLayerCache;
+
+// Multi-token forward that also populates the layer's K/V cache rows [0, T).
+// Equivalent to `full_attention_decoder_layer` for the hidden output. Caller is
+// responsible for advancing DecodeState::seq_len after all layers have run.
+void full_attention_decoder_layer_with_cache(const Tensor& hidden,
+                                             const FullAttentionDecoderLayerWeights& weights,
+                                             const Tensor& cos_table,
+                                             const Tensor& sin_table,
+                                             const std::vector<int32_t>& row_to_t,
+                                             const FullAttentionDecoderLayerConfig& config,
+                                             FullAttentionLayerCache& cache,
+                                             Tensor& out,
+                                             aclrtStream stream);
+
 struct LinearAttentionDecoderLayerConfig {
     double rms_epsilon;
 };
@@ -100,6 +115,20 @@ struct LinearAttentionLayerCache {
     Tensor conv_buf;          // [3, 6144] fp16, last 3 conv inputs (pre-conv qkv projection)
     Tensor recurrent_state;   // [16, 128, 128] fp32, gated delta rule state
 };
+
+// Multi-token linear-attention forward that advances cache.conv_buf and
+// cache.recurrent_state by T steps. Equivalent to T sequential
+// `linear_attention_decoder_layer_step` calls in terms of cache state, but
+// projections / conv1d / MLP run batched on [T, ...] inputs.
+// Requires the cache to be in its initial (post-`make_decode_state`) state:
+// both conv_buf and recurrent_state must be zero, since the multi-token
+// conv1d assumes implicit zero history.
+void linear_attention_decoder_layer_with_cache(const Tensor& hidden,
+                                               const LinearAttentionDecoderLayerWeights& weights,
+                                               const LinearAttentionDecoderLayerConfig& config,
+                                               LinearAttentionLayerCache& cache,
+                                               Tensor& out,
+                                               aclrtStream stream);
 
 struct DecodeState {
     int64_t max_seq_len{0};
