@@ -99,8 +99,18 @@ struct LayerWeights {
 int main(int argc, char** argv) {
     try {
         std::vector<int32_t> tokens;
+        std::string mode = "prefill";
         for (int i = 1; i < argc; ++i) {
-            tokens.push_back(std::stoi(argv[i]));
+            std::string arg = argv[i];
+            if (arg == "--mode") {
+                if (i + 1 >= argc) throw std::runtime_error("--mode requires a value");
+                mode = argv[++i];
+                if (mode != "prefill" && mode != "step") {
+                    throw std::runtime_error("--mode must be prefill or step");
+                }
+                continue;
+            }
+            tokens.push_back(std::stoi(arg));
         }
         if (tokens.empty()) tokens = {1, 2, 10, 100};
 
@@ -158,56 +168,124 @@ int main(int argc, char** argv) {
         }
 
         const int64_t T = static_cast<int64_t>(tokens.size());
-        Tensor hidden({T, Hidden}, DType::Float16);
-        Tensor next({T, Hidden}, DType::Float16);
-        hidden.allocate();
-        next.allocate();
-        embedding_lookup(embed, tokens, hidden, ctx.stream());
-
-        std::vector<uint16_t> cos_host(T * HalfRot), sin_host(T * HalfRot);
-        constexpr float RopeTheta = 10000000.0f;
-        for (int64_t t = 0; t < T; ++t) {
-            for (int64_t i = 0; i < HalfRot; ++i) {
-                float inv = std::pow(RopeTheta, -2.0f * static_cast<float>(i) / static_cast<float>(Rot));
-                float theta = static_cast<float>(t) * inv;
-                cos_host[t * HalfRot + i] = f2h(std::cos(theta));
-                sin_host[t * HalfRot + i] = f2h(std::sin(theta));
-            }
-        }
-        Tensor cos_t({T, HalfRot}, DType::Float16);
-        Tensor sin_t({T, HalfRot}, DType::Float16);
-        cos_t.copy_from_host(cos_host.data(), cos_host.size() * sizeof(uint16_t));
-        sin_t.copy_from_host(sin_host.data(), sin_host.size() * sizeof(uint16_t));
 
         LinearAttentionDecoderLayerConfig linear_config{1e-6};
         FullAttentionDecoderLayerConfig full_config{NumQHeads, NumKVHeads, HeadDim, Rot, 1e-6};
-        std::vector<int32_t> row_to_t(T);
-        for (int64_t t = 0; t < T; ++t) row_to_t[t] = static_cast<int32_t>(t);
 
-        for (int layer = 0; layer < NumLayers; ++layer) {
-            LayerWeights& lw = layers[layer];
-            if (layer_types[layer] == "linear_attention") {
-                LinearAttentionDecoderLayerWeights w{
-                    &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
-                    &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
-                    &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
-                };
-                linear_attention_decoder_layer(hidden, w, linear_config, next, ctx.stream());
-            } else {
-                FullAttentionDecoderLayerWeights w{
-                    &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
-                    &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w,
-                    &lw.down_w,
-                };
-                full_attention_decoder_layer(hidden, w, cos_t, sin_t, row_to_t, full_config, next, ctx.stream());
+        Tensor last_hidden({1, Hidden}, DType::Float16);
+        last_hidden.allocate();
+
+        if (mode == "prefill") {
+            Tensor hidden({T, Hidden}, DType::Float16);
+            Tensor next({T, Hidden}, DType::Float16);
+            hidden.allocate();
+            next.allocate();
+            embedding_lookup(embed, tokens, hidden, ctx.stream());
+
+            std::vector<uint16_t> cos_host(T * HalfRot), sin_host(T * HalfRot);
+            constexpr float RopeTheta = 10000000.0f;
+            for (int64_t t = 0; t < T; ++t) {
+                for (int64_t i = 0; i < HalfRot; ++i) {
+                    float inv = std::pow(RopeTheta, -2.0f * static_cast<float>(i) / static_cast<float>(Rot));
+                    float theta = static_cast<float>(t) * inv;
+                    cos_host[t * HalfRot + i] = f2h(std::cos(theta));
+                    sin_host[t * HalfRot + i] = f2h(std::sin(theta));
+                }
             }
-            copy_tensor(next, hidden, ctx.stream());
+            Tensor cos_t({T, HalfRot}, DType::Float16);
+            Tensor sin_t({T, HalfRot}, DType::Float16);
+            cos_t.copy_from_host(cos_host.data(), cos_host.size() * sizeof(uint16_t));
+            sin_t.copy_from_host(sin_host.data(), sin_host.size() * sizeof(uint16_t));
+
+            std::vector<int32_t> row_to_t(T);
+            for (int64_t t = 0; t < T; ++t) row_to_t[t] = static_cast<int32_t>(t);
+
+            for (int layer = 0; layer < NumLayers; ++layer) {
+                LayerWeights& lw = layers[layer];
+                if (layer_types[layer] == "linear_attention") {
+                    LinearAttentionDecoderLayerWeights w{
+                        &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
+                        &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
+                        &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+                    };
+                    linear_attention_decoder_layer(hidden, w, linear_config, next, ctx.stream());
+                } else {
+                    FullAttentionDecoderLayerWeights w{
+                        &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
+                        &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w,
+                        &lw.down_w,
+                    };
+                    full_attention_decoder_layer(hidden, w, cos_t, sin_t, row_to_t, full_config, next, ctx.stream());
+                }
+                copy_tensor(next, hidden, ctx.stream());
+            }
+
+            const size_t row_bytes = static_cast<size_t>(Hidden) * dtype_size(hidden.dtype());
+            auto* src = static_cast<const uint8_t*>(hidden.data()) + static_cast<size_t>(T - 1) * row_bytes;
+            check_acl(aclrtMemcpyAsync(last_hidden.data(), row_bytes, src, row_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()),
+                      "copy last hidden prefill");
+            check_acl(aclrtSynchronizeStream(ctx.stream()), "copy last hidden prefill sync");
+        } else {
+            DecodeState state = make_decode_state(static_cast<int64_t>(tokens.size()) + 4, layer_types, full_config, ctx.stream());
+
+            const int64_t HalfRotLocal = HalfRot;
+            Tensor cos_t({T, HalfRotLocal}, DType::Float16);
+            Tensor sin_t({T, HalfRotLocal}, DType::Float16);
+            std::vector<uint16_t> cos_host(T * HalfRotLocal), sin_host(T * HalfRotLocal);
+            constexpr float RopeTheta = 10000000.0f;
+            for (int64_t t = 0; t < T; ++t) {
+                for (int64_t i = 0; i < HalfRotLocal; ++i) {
+                    float inv = std::pow(RopeTheta, -2.0f * static_cast<float>(i) / static_cast<float>(Rot));
+                    float theta = static_cast<float>(t) * inv;
+                    cos_host[t * HalfRotLocal + i] = f2h(std::cos(theta));
+                    sin_host[t * HalfRotLocal + i] = f2h(std::sin(theta));
+                }
+            }
+            cos_t.copy_from_host(cos_host.data(), cos_host.size() * sizeof(uint16_t));
+            sin_t.copy_from_host(sin_host.data(), sin_host.size() * sizeof(uint16_t));
+
+            Tensor hidden({1, Hidden}, DType::Float16);
+            Tensor next({1, Hidden}, DType::Float16);
+            hidden.allocate();
+            next.allocate();
+            for (int64_t step = 0; step < T; ++step) {
+                std::vector<int32_t> one = {tokens[step]};
+                embedding_lookup(embed, one, hidden, ctx.stream());
+                int full_i = 0;
+                int linear_i = 0;
+                for (int layer = 0; layer < NumLayers; ++layer) {
+                    LayerWeights& lw = layers[layer];
+                    if (layer_types[layer] == "linear_attention") {
+                        LinearAttentionDecoderLayerWeights w{
+                            &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
+                            &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
+                            &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+                        };
+                        linear_attention_decoder_layer_step(hidden, w, linear_config, state.linear[linear_i], next, ctx.stream());
+                        ++linear_i;
+                    } else {
+                        FullAttentionDecoderLayerWeights w{
+                            &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
+                            &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w,
+                            &lw.down_w,
+                        };
+                        full_attention_decoder_layer_step(hidden, w, cos_t, sin_t,
+                                                          static_cast<int32_t>(step), state.seq_len,
+                                                          full_config, state.full[full_i], next, ctx.stream());
+                        ++full_i;
+                    }
+                    copy_tensor(next, hidden, ctx.stream());
+                }
+                ++state.seq_len;
+            }
+            copy_tensor(hidden, last_hidden, ctx.stream());
         }
 
-        Tensor normed({T, Hidden}, DType::Float16);
+        Tensor normed({1, Hidden}, DType::Float16);
         normed.allocate();
-        rms_norm(hidden, final_norm_w, normed, 1e-6, ctx.stream());
-        Tensor logits({T, vocab}, DType::Float16);
+        rms_norm(last_hidden, final_norm_w, normed, 1e-6, ctx.stream());
+        Tensor logits({1, vocab}, DType::Float16);
         logits.allocate();
         matmul_b_transposed(normed, embed, logits, ctx.stream());
 
@@ -224,7 +302,7 @@ int main(int argc, char** argv) {
                               return a.first > b.first;
                           });
 
-        std::cout << "{\"tokens\":[";
+        std::cout << "{\"mode\":\"" << mode << "\",\"tokens\":[";
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (i) std::cout << ",";
             std::cout << tokens[i];
