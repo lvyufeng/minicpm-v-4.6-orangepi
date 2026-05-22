@@ -139,9 +139,26 @@ int main() {
         }
     };
 
+    auto run_head = [&](const Tensor& hidden_last, double& head_ms) -> int32_t {
+        auto th0 = clk::now();
+        Tensor normed({1, Hidden}, DType::Float16); normed.allocate();
+        rms_norm(hidden_last, final_norm_w, normed, 1e-6, ctx.stream());
+        Tensor logits({1, vocab}, DType::Float16); logits.allocate();
+        matmul_b_transposed(normed, embed, logits, ctx.stream());
+        Tensor pred({1}, DType::Int64); pred.allocate();
+        argmax_last_dim(logits, pred, ctx.stream());
+        check_acl(aclrtSynchronizeStream(ctx.stream()), "head sync");
+        auto th1 = clk::now();
+        head_ms = ms_between(th0, th1);
+        int64_t host_pred = 0;
+        pred.copy_to_host(&host_pred, sizeof(host_pred));
+        return static_cast<int32_t>(host_pred);
+    };
+
     auto run_prefill = [&](const std::vector<int32_t>& tokens,
                            std::vector<double>& per_layer_ms,
-                           double& head_ms) -> int32_t {
+                           double& head_ms,
+                           Tensor& last_hidden_out) -> int32_t {
         const int64_t T = static_cast<int64_t>(tokens.size());
         Tensor hidden({T, Hidden}, DType::Float16);
         Tensor next({T, Hidden}, DType::Float16);
@@ -160,7 +177,6 @@ int main() {
         for (int64_t t = 0; t < T; ++t) row_to_t[t] = static_cast<int32_t>(t);
 
         per_layer_ms.assign(NumLayers, 0.0);
-
         for (int layer = 0; layer < NumLayers; ++layer) {
             const std::string& ltype = layer_types[layer];
             auto t0 = clk::now();
@@ -204,28 +220,152 @@ int main() {
             per_layer_ms[layer] = ms_between(t0, t1);
         }
 
-        auto th0 = clk::now();
-        Tensor normed({T, Hidden}, DType::Float16); normed.allocate();
-        rms_norm(hidden, final_norm_w, normed, 1e-6, ctx.stream());
-        Tensor logits({T, vocab}, DType::Float16); logits.allocate();
-        matmul_b_transposed(normed, embed, logits, ctx.stream());
-        Tensor pred({T}, DType::Int64); pred.allocate();
-        argmax_last_dim(logits, pred, ctx.stream());
-        check_acl(aclrtSynchronizeStream(ctx.stream()), "head sync");
-        auto th1 = clk::now();
-        head_ms = ms_between(th0, th1);
+        const size_t row_bytes = static_cast<size_t>(Hidden) * dtype_size(hidden.dtype());
+        auto* src = static_cast<const uint8_t*>(hidden.data()) + static_cast<size_t>(T - 1) * row_bytes;
+        check_acl(aclrtMemcpyAsync(last_hidden_out.data(), row_bytes, src, row_bytes,
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()),
+                  "copy last hidden");
+        check_acl(aclrtSynchronizeStream(ctx.stream()), "copy last hidden sync");
+        return run_head(last_hidden_out, head_ms);
+    };
 
-        std::vector<int64_t> host_pred(T);
-        pred.copy_to_host(host_pred.data(), host_pred.size() * sizeof(int64_t));
-        return static_cast<int32_t>(host_pred.back());
+    auto run_step_decode = [&](const std::vector<int32_t>& prompt_tokens,
+                               int32_t next_token,
+                               int64_t steps,
+                               double& avg_step_ms,
+                               double& avg_head_ms,
+                               int32_t& last_tok) {
+        DecodeState state = make_decode_state(static_cast<int64_t>(prompt_tokens.size()) + steps + 4,
+                                              layer_types, full_config, ctx.stream());
+        Tensor hidden_last({1, Hidden}, DType::Float16); hidden_last.allocate();
+
+        // warm cache with prompt via real step path
+        std::vector<uint16_t> cos_host, sin_host;
+        build_rope(static_cast<int64_t>(prompt_tokens.size() + steps + 4), cos_host, sin_host);
+        Tensor cos_t({static_cast<int64_t>(prompt_tokens.size() + steps + 4), HalfRot}, DType::Float16);
+        Tensor sin_t({static_cast<int64_t>(prompt_tokens.size() + steps + 4), HalfRot}, DType::Float16);
+        cos_t.copy_from_host(cos_host.data(), cos_host.size() * sizeof(uint16_t));
+        sin_t.copy_from_host(sin_host.data(), sin_host.size() * sizeof(uint16_t));
+
+        Tensor hidden({1, Hidden}, DType::Float16); hidden.allocate();
+        Tensor next({1, Hidden}, DType::Float16); next.allocate();
+        for (size_t step = 0; step < prompt_tokens.size(); ++step) {
+            embedding_lookup(embed, {prompt_tokens[step]}, hidden, ctx.stream());
+            int full_i = 0;
+            int linear_i = 0;
+            for (int layer = 0; layer < NumLayers; ++layer) {
+                const std::string& ltype = layer_types[layer];
+                if (ltype == "linear_attention") {
+                    LinearAttentionDecoderLayerWeights w{
+                        &layers[layer].input_norm_w,
+                        &layers[layer].post_norm_w,
+                        &layers[layer].qkv_w,
+                        &layers[layer].z_w,
+                        &layers[layer].a_w,
+                        &layers[layer].b_w,
+                        &layers[layer].conv_w,
+                        &layers[layer].dt_bias,
+                        &layers[layer].a_log,
+                        &layers[layer].gated_norm_w,
+                        &layers[layer].out_proj_w,
+                        &layers[layer].gate_w,
+                        &layers[layer].up_w,
+                        &layers[layer].down_w,
+                    };
+                    linear_attention_decoder_layer_step(hidden, w, linear_config, state.linear[linear_i], next, ctx.stream());
+                    ++linear_i;
+                } else {
+                    FullAttentionDecoderLayerWeights w{
+                        &layers[layer].input_norm_w,
+                        &layers[layer].post_norm_w,
+                        &layers[layer].q_w,
+                        &layers[layer].k_w,
+                        &layers[layer].v_w,
+                        &layers[layer].o_w,
+                        &layers[layer].q_norm_w,
+                        &layers[layer].k_norm_w,
+                        &layers[layer].gate_w,
+                        &layers[layer].up_w,
+                        &layers[layer].down_w,
+                    };
+                    full_attention_decoder_layer_step(hidden, w, cos_t, sin_t,
+                                                      static_cast<int32_t>(step), state.seq_len,
+                                                      full_config, state.full[full_i], next, ctx.stream());
+                    ++full_i;
+                }
+                copy_tensor(next, hidden, ctx.stream());
+            }
+            ++state.seq_len;
+        }
+
+        double total_step_ms = 0.0;
+        double total_head_ms = 0.0;
+        last_tok = next_token;
+        for (int64_t step = 0; step < steps; ++step) {
+            auto t0 = clk::now();
+            embedding_lookup(embed, {last_tok}, hidden, ctx.stream());
+            int full_i = 0;
+            int linear_i = 0;
+            for (int layer = 0; layer < NumLayers; ++layer) {
+                const std::string& ltype = layer_types[layer];
+                if (ltype == "linear_attention") {
+                    LinearAttentionDecoderLayerWeights w{
+                        &layers[layer].input_norm_w,
+                        &layers[layer].post_norm_w,
+                        &layers[layer].qkv_w,
+                        &layers[layer].z_w,
+                        &layers[layer].a_w,
+                        &layers[layer].b_w,
+                        &layers[layer].conv_w,
+                        &layers[layer].dt_bias,
+                        &layers[layer].a_log,
+                        &layers[layer].gated_norm_w,
+                        &layers[layer].out_proj_w,
+                        &layers[layer].gate_w,
+                        &layers[layer].up_w,
+                        &layers[layer].down_w,
+                    };
+                    linear_attention_decoder_layer_step(hidden, w, linear_config, state.linear[linear_i], next, ctx.stream());
+                    ++linear_i;
+                } else {
+                    FullAttentionDecoderLayerWeights w{
+                        &layers[layer].input_norm_w,
+                        &layers[layer].post_norm_w,
+                        &layers[layer].q_w,
+                        &layers[layer].k_w,
+                        &layers[layer].v_w,
+                        &layers[layer].o_w,
+                        &layers[layer].q_norm_w,
+                        &layers[layer].k_norm_w,
+                        &layers[layer].gate_w,
+                        &layers[layer].up_w,
+                        &layers[layer].down_w,
+                    };
+                    full_attention_decoder_layer_step(hidden, w, cos_t, sin_t,
+                                                      static_cast<int32_t>(state.seq_len), state.seq_len,
+                                                      full_config, state.full[full_i], next, ctx.stream());
+                    ++full_i;
+                }
+                copy_tensor(next, hidden, ctx.stream());
+            }
+            ++state.seq_len;
+            double head_ms = 0.0;
+            last_tok = run_head(hidden, head_ms);
+            auto t1 = clk::now();
+            total_step_ms += ms_between(t0, t1);
+            total_head_ms += head_ms;
+        }
+        avg_step_ms = total_step_ms / static_cast<double>(steps);
+        avg_head_ms = total_head_ms / static_cast<double>(steps);
     };
 
     std::vector<int32_t> tokens = {1, 2, 10, 100};
     std::vector<double> per_layer_ms;
     double head_ms = 0.0;
+    Tensor last_hidden({1, Hidden}, DType::Float16); last_hidden.allocate();
 
     auto t_prefill_start = clk::now();
-    int32_t first_tok = run_prefill(tokens, per_layer_ms, head_ms);
+    int32_t first_tok = run_prefill(tokens, per_layer_ms, head_ms, last_hidden);
     auto t_prefill_end = clk::now();
     double total_ms = ms_between(t_prefill_start, t_prefill_end);
 
@@ -252,23 +392,18 @@ int main() {
                   << " ms=" << per_layer_ms[layer] << std::endl;
     }
 
-    tokens.push_back(first_tok);
-    auto t_decode_start = clk::now();
+    double avg_step_ms = 0.0;
+    double avg_step_head_ms = 0.0;
     int32_t last_tok = first_tok;
-    for (int step = 1; step < NumGenerate; ++step) {
-        std::vector<double> tmp_layer_ms;
-        double tmp_head_ms = 0.0;
-        last_tok = run_prefill(tokens, tmp_layer_ms, tmp_head_ms);
-        tokens.push_back(last_tok);
-    }
-    auto t_decode_end = clk::now();
-    double decode_ms = ms_between(t_decode_start, t_decode_end);
-    std::cout << "decode_total_ms=" << decode_ms
+    run_step_decode(tokens, first_tok, NumGenerate - 1, avg_step_ms, avg_step_head_ms, last_tok);
+    std::cout << "decode_step_avg_ms=" << avg_step_ms
+              << " head_avg_ms=" << avg_step_head_ms
               << " steps=" << (NumGenerate - 1)
-              << " avg_per_step_ms=" << (decode_ms / (NumGenerate - 1))
               << " last_tok=" << last_tok << std::endl;
     std::cout << "lm profile smoke ok generated_seq=";
-    for (auto t : tokens) std::cout << t << ",";
+    std::vector<int32_t> shown = tokens;
+    shown.push_back(first_tok);
+    for (auto t : shown) std::cout << t << ",";
     std::cout << std::endl;
     return 0;
 }
