@@ -50,6 +50,35 @@ void copy_tensor(const Tensor& src, Tensor& dst, aclrtStream stream) {
     check_acl(aclrtSynchronizeStream(stream), "lm copy_tensor sync");
 }
 
+// Load a 2D matmul weight stored as [N, K] in safetensors and return it as
+// [K, N] (natural layout for our cube matmul fast path). Cube kernel beats
+// aclnnMm 2-7x at M=1 for the shapes we hit at decode time; the host wrapper
+// `matmul_b_transposed` falls back to aclnnMm for shapes the cube can't take.
+// Keeps original layout for shapes the cube fast-path can't accelerate so
+// memory and model-load time aren't wasted on a transpose that won't help.
+Tensor load_matmul_weight_transposed(WeightsIndex& index, int layer, const std::string& suffix) {
+    Tensor src = load_layer_weight(index, layer, suffix);
+    if (src.shape().size() != 2) {
+        throw std::runtime_error("matmul weight " + suffix + " expected 2D");
+    }
+    const int64_t N = src.shape()[0];
+    const int64_t K = src.shape()[1];
+    if (N > 16384 || (N % 128) != 0) {
+        return src;  // cube fast-path doesn't apply; keep [N, K]
+    }
+    std::vector<uint16_t> hostNK(static_cast<size_t>(N) * K);
+    src.copy_to_host(hostNK.data(), hostNK.size() * sizeof(uint16_t));
+    std::vector<uint16_t> hostKN(static_cast<size_t>(K) * N);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+            hostKN[k * N + n] = hostNK[n * K + k];
+        }
+    }
+    Tensor dst({K, N}, DType::Float16);
+    dst.copy_from_host(hostKN.data(), hostKN.size() * sizeof(uint16_t));
+    return dst;
+}
+
 }  // namespace
 
 LanguageModelConfig default_minicpmv46_lm_config() {
@@ -75,24 +104,24 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
         auto& lw = w.layers[layer];
         lw.input_norm_w = load_layer_weight(index, static_cast<int>(layer), "input_layernorm.weight");
         lw.post_norm_w = load_layer_weight(index, static_cast<int>(layer), "post_attention_layernorm.weight");
-        lw.gate_w = load_layer_weight(index, static_cast<int>(layer), "mlp.gate_proj.weight");
-        lw.up_w = load_layer_weight(index, static_cast<int>(layer), "mlp.up_proj.weight");
-        lw.down_w = load_layer_weight(index, static_cast<int>(layer), "mlp.down_proj.weight");
+        lw.gate_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "mlp.gate_proj.weight");
+        lw.up_w   = load_matmul_weight_transposed(index, static_cast<int>(layer), "mlp.up_proj.weight");
+        lw.down_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "mlp.down_proj.weight");
         if (cfg.layer_types[layer] == "linear_attention") {
-            lw.qkv_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.in_proj_qkv.weight");
-            lw.z_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.in_proj_z.weight");
+            lw.qkv_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.in_proj_qkv.weight");
+            lw.z_w   = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.in_proj_z.weight");
             lw.a_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.in_proj_a.weight");
             lw.b_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.in_proj_b.weight");
             lw.conv_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.conv1d.weight");
             lw.dt_bias = load_layer_weight(index, static_cast<int>(layer), "linear_attn.dt_bias");
             lw.a_log = load_layer_weight(index, static_cast<int>(layer), "linear_attn.A_log");
             lw.gated_norm_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.norm.weight");
-            lw.out_proj_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.out_proj.weight");
+            lw.out_proj_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.out_proj.weight");
         } else {
-            lw.q_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.q_proj.weight");
-            lw.k_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.k_proj.weight");
-            lw.v_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.v_proj.weight");
-            lw.o_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.o_proj.weight");
+            lw.q_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.q_proj.weight");
+            lw.k_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.k_proj.weight");
+            lw.v_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.v_proj.weight");
+            lw.o_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.o_proj.weight");
             lw.q_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.q_norm.weight");
             lw.k_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.k_norm.weight");
         }

@@ -193,6 +193,13 @@ void copy_matrix_rows(const Tensor& src, int64_t src_row, Tensor& dst, int64_t d
 }
 
 
+// Matmul weights can be stored as [N, K] (legacy matmul_b_transposed layout)
+// or [K, N] (pre-transposed for cube fast path); accept either.
+inline bool matmul_shape_ok(const Tensor* t, int64_t N, int64_t K) {
+    const auto& s = t->shape();
+    return s == std::vector<int64_t>{N, K} || s == std::vector<int64_t>{K, N};
+}
+
 void validate_shapes(const Tensor& hidden,
                      const FullAttentionDecoderLayerWeights& w,
                      const FullAttentionDecoderLayerConfig& c,
@@ -248,19 +255,26 @@ void run_full_attention_core(const Tensor& hidden,
     const int64_t QMainDim = NumQHeads * HeadDim;
     const int64_t KVDim = NumKVHeads * HeadDim;
     const int64_t QProjOut = QMainDim * 2;
-    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    const int64_t Intermediate = [&]{
+        const auto& s = weights.gate_proj_weight->shape();
+        if (s.size() == 2) {
+            if (s[1] == Hidden) return s[0];
+            if (s[0] == Hidden) return s[1];
+        }
+        return s[0];
+    }();
 
     if (weights.input_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
         weights.post_attention_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
-        weights.q_proj_weight->shape() != std::vector<int64_t>{QProjOut, Hidden} ||
-        weights.k_proj_weight->shape() != std::vector<int64_t>{KVDim, Hidden} ||
-        weights.v_proj_weight->shape() != std::vector<int64_t>{KVDim, Hidden} ||
-        weights.o_proj_weight->shape() != std::vector<int64_t>{Hidden, QMainDim} ||
+        !matmul_shape_ok(weights.q_proj_weight, QProjOut, Hidden) ||
+        !matmul_shape_ok(weights.k_proj_weight, KVDim, Hidden) ||
+        !matmul_shape_ok(weights.v_proj_weight, KVDim, Hidden) ||
+        !matmul_shape_ok(weights.o_proj_weight, Hidden, QMainDim) ||
         weights.q_norm_weight->shape() != std::vector<int64_t>{HeadDim} ||
         weights.k_norm_weight->shape() != std::vector<int64_t>{HeadDim} ||
-        weights.gate_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
-        weights.up_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
-        weights.down_proj_weight->shape() != std::vector<int64_t>{Hidden, Intermediate}) {
+        !matmul_shape_ok(weights.gate_proj_weight, Intermediate, Hidden) ||
+        !matmul_shape_ok(weights.up_proj_weight, Intermediate, Hidden) ||
+        !matmul_shape_ok(weights.down_proj_weight, Hidden, Intermediate)) {
         throw std::runtime_error("decoder layer weight shape mismatch");
     }
     if (static_cast<int64_t>(row_to_t.size()) != T) {
@@ -453,12 +467,19 @@ void linear_attention_decoder_layer_stub(const Tensor& hidden,
 
     const int64_t T = hidden.shape()[0];
     const int64_t Hidden = hidden.shape()[1];
-    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    const int64_t Intermediate = [&]{
+        const auto& s = weights.gate_proj_weight->shape();
+        if (s.size() == 2) {
+            if (s[1] == Hidden) return s[0];
+            if (s[0] == Hidden) return s[1];
+        }
+        return s[0];
+    }();
     if (weights.input_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
         weights.post_attention_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
-        weights.gate_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
-        weights.up_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
-        weights.down_proj_weight->shape() != std::vector<int64_t>{Hidden, Intermediate}) {
+        !matmul_shape_ok(weights.gate_proj_weight, Intermediate, Hidden) ||
+        !matmul_shape_ok(weights.up_proj_weight, Intermediate, Hidden) ||
+        !matmul_shape_ok(weights.down_proj_weight, Hidden, Intermediate)) {
         throw std::runtime_error("linear decoder layer weight shape mismatch");
     }
 
@@ -556,22 +577,29 @@ void linear_attention_decoder_layer(const Tensor& hidden,
     const int64_t KeyDim = NumHeads * HeadDim;
     const int64_t ValueDim = NumHeads * HeadDim;
     const int64_t ConvDim = 2 * KeyDim + ValueDim;
-    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    const int64_t Intermediate = [&]{
+        const auto& s = weights.gate_proj_weight->shape();
+        if (s.size() == 2) {
+            if (s[1] == Hidden) return s[0];
+            if (s[0] == Hidden) return s[1];
+        }
+        return s[0];
+    }();
 
-    if (weights.in_proj_qkv_weight->shape() != std::vector<int64_t>{ConvDim, Hidden} ||
-        weights.in_proj_z_weight->shape() != std::vector<int64_t>{ValueDim, Hidden} ||
-        weights.in_proj_a_weight->shape() != std::vector<int64_t>{NumHeads, Hidden} ||
-        weights.in_proj_b_weight->shape() != std::vector<int64_t>{NumHeads, Hidden} ||
+    if (!matmul_shape_ok(weights.in_proj_qkv_weight, ConvDim, Hidden) ||
+        !matmul_shape_ok(weights.in_proj_z_weight, ValueDim, Hidden) ||
+        !matmul_shape_ok(weights.in_proj_a_weight, NumHeads, Hidden) ||
+        !matmul_shape_ok(weights.in_proj_b_weight, NumHeads, Hidden) ||
         weights.conv1d_weight->shape() != std::vector<int64_t>{ConvDim, 1, 4} ||
         weights.dt_bias->shape() != std::vector<int64_t>{NumHeads} ||
         weights.a_log->shape() != std::vector<int64_t>{NumHeads} ||
         weights.gated_norm_weight->shape() != std::vector<int64_t>{HeadDim} ||
-        weights.out_proj_weight->shape() != std::vector<int64_t>{Hidden, ValueDim} ||
+        !matmul_shape_ok(weights.out_proj_weight, Hidden, ValueDim) ||
         weights.input_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
         weights.post_attention_norm_weight->shape() != std::vector<int64_t>{Hidden} ||
-        weights.gate_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
-        weights.up_proj_weight->shape() != std::vector<int64_t>{Intermediate, Hidden} ||
-        weights.down_proj_weight->shape() != std::vector<int64_t>{Hidden, Intermediate}) {
+        !matmul_shape_ok(weights.gate_proj_weight, Intermediate, Hidden) ||
+        !matmul_shape_ok(weights.up_proj_weight, Intermediate, Hidden) ||
+        !matmul_shape_ok(weights.down_proj_weight, Hidden, Intermediate)) {
         throw std::runtime_error("linear decoder layer weight shape mismatch");
     }
 
@@ -691,7 +719,14 @@ void linear_attention_decoder_layer_with_cache(const Tensor& hidden,
     const int64_t KeyDim = NumHeads * HeadDim;
     const int64_t ValueDim = NumHeads * HeadDim;
     const int64_t ConvDim = 2 * KeyDim + ValueDim;
-    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    const int64_t Intermediate = [&]{
+        const auto& s = weights.gate_proj_weight->shape();
+        if (s.size() == 2) {
+            if (s[1] == Hidden) return s[0];
+            if (s[0] == Hidden) return s[1];
+        }
+        return s[0];
+    }();
 
     Tensor normed({T, Hidden}, DType::Float16); normed.allocate();
     rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
@@ -860,7 +895,14 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     const int64_t QMainDim = NumQHeads * HeadDim;
     const int64_t KVDim = NumKVHeads * HeadDim;
     const int64_t QProjOut = QMainDim * 2;
-    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    const int64_t Intermediate = [&]{
+        const auto& s = weights.gate_proj_weight->shape();
+        if (s.size() == 2) {
+            if (s[1] == Hidden) return s[0];
+            if (s[0] == Hidden) return s[1];
+        }
+        return s[0];
+    }();
     const int64_t Context = cache_len + 1;
 
     if (cache.k_cache.shape() != std::vector<int64_t>{cache.k_cache.shape()[0], KVDim} ||
@@ -974,7 +1016,14 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     const int64_t KeyDim = NumHeads * HeadDim;
     const int64_t ValueDim = NumHeads * HeadDim;
     const int64_t ConvDim = 2 * KeyDim + ValueDim;
-    const int64_t Intermediate = weights.gate_proj_weight->shape()[0];
+    const int64_t Intermediate = [&]{
+        const auto& s = weights.gate_proj_weight->shape();
+        if (s.size() == 2) {
+            if (s[1] == Hidden) return s[0];
+            if (s[0] == Hidden) return s[1];
+        }
+        return s[0];
+    }();
 
     Tensor normed({1, Hidden}, DType::Float16); normed.allocate();
     rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);

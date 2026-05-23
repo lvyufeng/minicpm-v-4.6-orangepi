@@ -25,6 +25,7 @@
 #include "aclnn_attention_step_custom.h"
 #include "aclnn_silu_mul_custom.h"
 #include "aclnn_matmul_vec_custom.h"
+#include "aclnn_matmul_cube_custom.h"
 
 namespace minicpmv {
 
@@ -150,37 +151,73 @@ void matmul_b_transposed(const Tensor& a, const Tensor& b, Tensor& out, aclrtStr
     if (a.shape().size() != 2 || b.shape().size() != 2 || out.shape().size() != 2) {
         throw std::runtime_error("matmul_b_transposed tensors must be 2D");
     }
-    // A[M,K] * B^T[K,N], where B is stored as [N,K]
-    if (a.shape()[1] != b.shape()[1]) {
+    const int64_t M = a.shape()[0];
+    const int64_t K = a.shape()[1];
+
+    // B can be either [N, K] (legacy matmul_b_transposed convention) or [K, N]
+    // (pre-transposed for cube fast path). When N != K only one matches.
+    const bool bIsTransposed = (b.shape()[1] == K);  // storage [N, K]
+    const bool bIsNatural    = (b.shape()[0] == K) && (b.shape()[1] != K);  // [K, N], unambiguous
+    if (!bIsTransposed && !bIsNatural) {
         throw std::runtime_error("matmul_b_transposed K dim mismatch");
     }
-    if (a.shape()[0] != out.shape()[0] || b.shape()[0] != out.shape()[1]) {
+    const int64_t N = bIsTransposed ? b.shape()[0] : b.shape()[1];
+    if (a.shape()[0] != out.shape()[0] || N != out.shape()[1]) {
         throw std::runtime_error("matmul_b_transposed out shape mismatch");
     }
 
-    // NOTE: We have a custom aclnnMatmulVecCustom kernel for the M=1 case
-    // (vector-by-matrix), but it's ~30-40% slower than aclnnMm in practice.
-    // aclnnMm uses the cube unit which is well-tuned even for T=1; a pure
-    // vector-unit Mul + ReduceSum loop can't compete. Keeping the kernel in
-    // the tree as a reference. The real lever for decode at T=1 is matmul
-    // stacking (qkv+, gate+up) and/or weight quantization, not a hand-rolled
-    // T=1 matmul. See engine/build/bench_matmul_vec for the data.
+    // Cube fast path: B already pre-transposed to [K, N], M=1, N divisible by
+    // 128 (= 8 cores * 16 align), N <= 16384. Cube beats aclnnMm 2-7x at these
+    // shapes per bench_matmul_vec. Larger N (e.g., lm_head N=248094) falls
+    // back to aclnnMm because the cube tiling currently produces wrong output
+    // for N >= ~32k.
+    if (bIsNatural && M == 1 && a.dtype() == DType::Float16 &&
+        b.dtype() == DType::Float16 && out.dtype() == DType::Float16 &&
+        N <= 16384 && (N % 128) == 0) {
+        AclTensorHandle ha2, hb2, ho2;
+        make_acl_tensor(a, ha2);
+        make_acl_tensor(b, hb2);
+        make_acl_tensor(out, ho2);
+        uint64_t ws_size = 0;
+        aclOpExecutor* executor = nullptr;
+        auto ret = aclnnMatmulCubeCustomGetWorkspaceSize(ha2.tensor, hb2.tensor, ho2.tensor,
+                                                          &ws_size, &executor);
+        if (ret != 0) {
+            throw std::runtime_error("aclnnMatmulCubeCustomGetWorkspaceSize failed: " + std::to_string(ret));
+        }
+        void* workspace = nullptr;
+        if (ws_size > 0) {
+            check_acl(aclrtMalloc(&workspace, ws_size, ACL_MEM_MALLOC_HUGE_FIRST), "matmul_cube ws malloc");
+        }
+        ret = aclnnMatmulCubeCustom(workspace, ws_size, executor, stream);
+        auto sync_ret = aclrtSynchronizeStream(stream);
+        if (workspace) aclrtFree(workspace);
+        if (ret != 0) {
+            throw std::runtime_error("aclnnMatmulCubeCustom failed: " + std::to_string(ret));
+        }
+        check_acl(sync_ret, "aclrtSynchronizeStream matmul_cube");
+        return;
+    }
 
     AclTensorHandle ha, hb, ho;
     make_acl_tensor(a, ha);
     make_acl_tensor(out, ho);
 
-    // Build a transposed view for B: storage [N,K], logical view [K,N], strides [1,K]
-    hb.storage_dims = b.shape();
-    hb.view_dims = {b.shape()[1], b.shape()[0]};
-    hb.strides = {1, b.shape()[1]};
-    hb.tensor = aclCreateTensor(
-        hb.view_dims.data(), hb.view_dims.size(), to_acl_dtype(b.dtype()),
-        hb.strides.data(), 0, ACL_FORMAT_ND,
-        hb.storage_dims.data(), hb.storage_dims.size(),
-        b.data());
-    if (hb.tensor == nullptr) {
-        throw std::runtime_error("aclCreateTensor returned null for transposed B view");
+    if (bIsNatural) {
+        make_acl_tensor(b, hb);  // [K, N], no view dance — aclnnMm handles natural B
+    } else {
+        // Legacy: build a transposed view for B: storage [N,K], logical [K,N].
+        hb.storage_dims = b.shape();
+        hb.view_dims = {b.shape()[1], b.shape()[0]};
+        hb.strides = {1, b.shape()[1]};
+        hb.tensor = aclCreateTensor(
+            hb.view_dims.data(), hb.view_dims.size(), to_acl_dtype(b.dtype()),
+            hb.strides.data(), 0, ACL_FORMAT_ND,
+            hb.storage_dims.data(), hb.storage_dims.size(),
+            b.data());
+        if (hb.tensor == nullptr) {
+            throw std::runtime_error("aclCreateTensor returned null for transposed B view");
+        }
     }
 
     uint64_t ws_size = 0;
