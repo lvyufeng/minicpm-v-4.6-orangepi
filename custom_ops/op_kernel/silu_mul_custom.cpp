@@ -77,6 +77,12 @@ public:
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             DataCopy(outGm[offset], outFp16, nAligned);
+            // V->MTE2 sync: the next iteration's DataCopy(gFp16/uFp16) must not
+            // race with this iter's Cast/Muls/Exp/Div/Mul that read those UB
+            // buffers in the V pipe. Without this the kernel is
+            // non-deterministic when blockLen > TILE_ELEMS (multi-tile loops).
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
             WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
         }
