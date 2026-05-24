@@ -1380,4 +1380,34 @@ void muls(const Tensor& self, float scalar, Tensor& out, aclrtStream stream) {
     aclDestroyScalar(s);
 }
 
+void mean(const Tensor& self,
+          const std::vector<int64_t>& dims,
+          bool keep_dim,
+          Tensor& out,
+          aclrtStream stream) {
+    if (self.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("mean requires fp16 tensors");
+    }
+    AclTensorHandle hs, ho;
+    make_acl_tensor(self, hs);
+    make_acl_tensor(out, ho);
+    aclIntArray* dim_arr = aclCreateIntArray(dims.data(), dims.size());
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnMeanGetWorkspaceSize(hs.tensor, dim_arr, keep_dim,
+                                         to_acl_dtype(self.dtype()),
+                                         ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        aclDestroyIntArray(dim_arr);
+        throw std::runtime_error("aclnnMeanGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    try {
+        run_op("aclnnMean", ws_size, executor, stream, aclnnMean);
+    } catch (...) {
+        aclDestroyIntArray(dim_arr);
+        throw;
+    }
+    aclDestroyIntArray(dim_arr);
+}
+
 }  // namespace minicpmv

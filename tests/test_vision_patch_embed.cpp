@@ -62,34 +62,56 @@ int main() {
     WeightsIndex index(default_safetensors_path());
     VisionConfig cfg = default_minicpmv46_vision_config();
 
-    // Load just patch_embed + position_embedding + layer-0 weights to keep
-    // NPU memory tiny (full 27-layer load is ~1.5 GB and may interact with
-    // kernel-cache eviction during the encoder forward).
+    // Load patch_embed + position_embedding + the first 7 encoder layers
+    // (HF applies vit_merger AFTER layer 6, i.e. after running layers 0..6).
     VisionWeights vw;
     vw.patch_embedding_w = index.load_to_device_as("model.vision_tower.embeddings.patch_embedding.weight", DType::Float16);
     vw.patch_embedding_b = index.load_to_device_as("model.vision_tower.embeddings.patch_embedding.bias", DType::Float16);
     vw.position_embedding = index.load_to_device_as("model.vision_tower.embeddings.position_embedding.weight", DType::Float16);
-    vw.layers.resize(1);
-    auto& l0 = vw.layers[0];
-    auto L = [&](const char* s) {
-        return index.load_to_device_as(std::string("model.vision_tower.encoder.layers.0.") + s, DType::Float16);
+    vw.layers.resize(7);
+    for (int li = 0; li < 7; ++li) {
+        auto& lw = vw.layers[li];
+        auto L = [&](const char* s) {
+            return index.load_to_device_as(
+                std::string("model.vision_tower.encoder.layers.") + std::to_string(li) + "." + s,
+                DType::Float16);
+        };
+        lw.layer_norm1_w = L("layer_norm1.weight");
+        lw.layer_norm1_b = L("layer_norm1.bias");
+        lw.q_w = L("self_attn.q_proj.weight");
+        lw.q_b = L("self_attn.q_proj.bias");
+        lw.k_w = L("self_attn.k_proj.weight");
+        lw.k_b = L("self_attn.k_proj.bias");
+        lw.v_w = L("self_attn.v_proj.weight");
+        lw.v_b = L("self_attn.v_proj.bias");
+        lw.out_proj_w = L("self_attn.out_proj.weight");
+        lw.out_proj_b = L("self_attn.out_proj.bias");
+        lw.layer_norm2_w = L("layer_norm2.weight");
+        lw.layer_norm2_b = L("layer_norm2.bias");
+        lw.fc1_w = L("mlp.fc1.weight");
+        lw.fc1_b = L("mlp.fc1.bias");
+        lw.fc2_w = L("mlp.fc2.weight");
+        lw.fc2_b = L("mlp.fc2.bias");
+    }
+    auto WL = [&](const char* s) {
+        return index.load_to_device_as(std::string("model.vision_tower.vit_merger.") + s, DType::Float16);
     };
-    l0.layer_norm1_w = L("layer_norm1.weight");
-    l0.layer_norm1_b = L("layer_norm1.bias");
-    l0.q_w = L("self_attn.q_proj.weight");
-    l0.q_b = L("self_attn.q_proj.bias");
-    l0.k_w = L("self_attn.k_proj.weight");
-    l0.k_b = L("self_attn.k_proj.bias");
-    l0.v_w = L("self_attn.v_proj.weight");
-    l0.v_b = L("self_attn.v_proj.bias");
-    l0.out_proj_w = L("self_attn.out_proj.weight");
-    l0.out_proj_b = L("self_attn.out_proj.bias");
-    l0.layer_norm2_w = L("layer_norm2.weight");
-    l0.layer_norm2_b = L("layer_norm2.bias");
-    l0.fc1_w = L("mlp.fc1.weight");
-    l0.fc1_b = L("mlp.fc1.bias");
-    l0.fc2_w = L("mlp.fc2.weight");
-    l0.fc2_b = L("mlp.fc2.bias");
+    vw.vit_merger.layer_norm1_w = WL("layer_norm1.weight");
+    vw.vit_merger.layer_norm1_b = WL("layer_norm1.bias");
+    vw.vit_merger.q_w = WL("self_attn.q_proj.weight");
+    vw.vit_merger.q_b = WL("self_attn.q_proj.bias");
+    vw.vit_merger.k_w = WL("self_attn.k_proj.weight");
+    vw.vit_merger.k_b = WL("self_attn.k_proj.bias");
+    vw.vit_merger.v_w = WL("self_attn.v_proj.weight");
+    vw.vit_merger.v_b = WL("self_attn.v_proj.bias");
+    vw.vit_merger.out_proj_w = WL("self_attn.out_proj.weight");
+    vw.vit_merger.out_proj_b = WL("self_attn.out_proj.bias");
+    vw.vit_merger.pre_norm_w = WL("pre_norm.weight");
+    vw.vit_merger.pre_norm_b = WL("pre_norm.bias");
+    vw.vit_merger.linear_1_w = WL("linear_1.weight");
+    vw.vit_merger.linear_1_b = WL("linear_1.bias");
+    vw.vit_merger.linear_2_w = WL("linear_2.weight");
+    vw.vit_merger.linear_2_b = WL("linear_2.bias");
 
     Tensor patch_out({1, P, Hidden}, DType::Float16); patch_out.allocate();
     vision_patch_embed(pix, vw.patch_embedding_w, vw.patch_embedding_b, Patch, patch_out, ctx.stream());
@@ -125,6 +147,38 @@ int main() {
         layer0_out.copy_to_host(ho.data(), ho.size() * 2);
         auto ref = read_f16("/tmp/vision_ref_layer0.f16", ho.size() * 2);
         compare(ho, ref, "encoder_layer0", 0.2f);
+    }
+
+    // Layers 1..6 stacked
+    Tensor cur({1, P, Hidden}, DType::Float16); cur.allocate();
+    aclrtMemcpyAsync(cur.data(), cur.size_bytes(), layer0_out.data(), layer0_out.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream());
+    aclrtSynchronizeStream(ctx.stream());
+    for (int li = 1; li < 7; ++li) {
+        Tensor next({1, P, Hidden}, DType::Float16); next.allocate();
+        vision_encoder_layer(cur, vw.layers[li], Heads, cfg.layer_norm_eps, next, ctx.stream());
+        aclrtMemcpyAsync(cur.data(), cur.size_bytes(), next.data(), next.size_bytes(),
+                         ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream());
+        aclrtSynchronizeStream(ctx.stream());
+    }
+    {
+        std::vector<uint16_t> ho(static_cast<size_t>(P * Hidden));
+        cur.copy_to_host(ho.data(), ho.size() * 2);
+        auto ref = read_f16("/tmp/vision_ref_layer6.f16", ho.size() * 2);
+        compare(ho, ref, "encoder_layer6_stack", 0.5f);
+    }
+
+    // vit_merger: reduces P=1024 → P/4=256
+    const int64_t Wm = 4;
+    const int64_t Pm = P / Wm;
+    Tensor vm_out({1, Pm, Hidden}, DType::Float16); vm_out.allocate();
+    vision_vit_merger(cur, target_h, target_w, cfg.window_h, cfg.window_w, Heads,
+                      vw.vit_merger, cfg.layer_norm_eps, vm_out, ctx.stream());
+    {
+        std::vector<uint16_t> ho(static_cast<size_t>(Pm * Hidden));
+        vm_out.copy_to_host(ho.data(), ho.size() * 2);
+        auto ref = read_f16("/tmp/vision_ref_vit_merger.f16", ho.size() * 2);
+        compare(ho, ref, "vit_merger", 1.0f);
     }
     return 0;
 }

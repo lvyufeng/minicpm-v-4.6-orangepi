@@ -305,4 +305,204 @@ void vision_encoder_layer(const Tensor& hidden,
     add(after_attn, fc2_out_3d, out, stream);
 }
 
+// MiniCPM-V's ViT window-attention merger. Reorders patches by 2x2 windows,
+// runs self-attention within each window, un-reorders, residual, then spatial
+// concat 4 patches and an MLP to produce a token sequence 4x shorter.
+//
+// Mirrors transformers/models/minicpmv4_6/modeling_minicpmv4_6.py
+// `MiniCPMV4_6ViTWindowAttentionMerger.forward`.
+void vision_vit_merger(const Tensor& hidden,
+                       int64_t target_h,
+                       int64_t target_w,
+                       int64_t window_h,
+                       int64_t window_w,
+                       int64_t num_heads,
+                       const VitMergerWeights& w,
+                       double layer_norm_eps,
+                       Tensor& out,
+                       aclrtStream stream) {
+    if (hidden.shape().size() != 3 || hidden.shape()[0] != 1) {
+        throw std::runtime_error("vit_merger expects [1, P, H]");
+    }
+    const int64_t P = hidden.shape()[1];
+    const int64_t H = hidden.shape()[2];
+    if (P != target_h * target_w) throw std::runtime_error("vit_merger P mismatch target_sizes");
+    if (target_h % window_h != 0 || target_w % window_w != 0) {
+        throw std::runtime_error("vit_merger target sizes must be divisible by window");
+    }
+    const int64_t W = window_h * window_w;          // tokens per window (4 for 2x2)
+    const int64_t merged_h = target_h / window_h;   // 16 for 32x32
+    const int64_t merged_w = target_w / window_w;
+    const int64_t num_windows = merged_h * merged_w;
+    const int64_t window_hidden = H * W;            // 4608 for H=1152, W=4
+    if (num_windows * W != P) throw std::runtime_error("vit_merger window count mismatch");
+    const int64_t D = H / num_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    // --- Build window_index permutation on host:
+    //   index = arange(target_h * target_w).reshape(target_h, target_w)
+    //   index.reshape(merged_h, window_h, merged_w, window_w)
+    //   index.permute(0, 2, 1, 3).reshape(-1)
+    std::vector<int32_t> window_index(P);
+    std::vector<int32_t> inv_index(P);
+    for (int64_t mh = 0; mh < merged_h; ++mh)
+        for (int64_t mw = 0; mw < merged_w; ++mw)
+            for (int64_t ih = 0; ih < window_h; ++ih)
+                for (int64_t iw = 0; iw < window_w; ++iw) {
+                    const int64_t orig_h = mh * window_h + ih;
+                    const int64_t orig_w = mw * window_w + iw;
+                    const int64_t new_pos = ((mh * merged_w + mw) * window_h + ih) * window_w + iw;
+                    window_index[new_pos] = static_cast<int32_t>(orig_h * target_w + orig_w);
+                }
+    for (int64_t i = 0; i < P; ++i) inv_index[window_index[i]] = static_cast<int32_t>(i);
+
+    // --- residual1 = hidden (kept for later add)
+    // --- ln1 = layer_norm(hidden) over [H]
+    Tensor ln1({1, P, H}, DType::Float16); ln1.allocate();
+    layer_norm(hidden, w.layer_norm1_w, w.layer_norm1_b, ln1, layer_norm_eps, stream);
+
+    // 2D view for the gather/scatter
+    Tensor ln1_2d({P, H}, DType::Float16); ln1_2d.allocate();
+    aclrtMemcpyAsync(ln1_2d.data(), ln1_2d.size_bytes(), ln1.data(), ln1.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+
+    // --- reordered = ln1[window_index]  (gather rows)
+    Tensor reordered({P, H}, DType::Float16); reordered.allocate();
+    embedding_lookup(ln1_2d, window_index, reordered, stream);
+
+    // --- windowed self-attention:
+    //   q,k,v = reordered @ W^T + b   -> [P, H]
+    //   reshape [P, H] -> [num_windows, W, heads, D] -> [num_windows, heads, W, D]
+    Tensor q({P, H}, DType::Float16); q.allocate();
+    Tensor k({P, H}, DType::Float16); k.allocate();
+    Tensor v({P, H}, DType::Float16); v.allocate();
+    linear_bias(reordered, w.q_w, &w.q_b, q, stream);
+    linear_bias(reordered, w.k_w, &w.k_b, k, stream);
+    linear_bias(reordered, w.v_w, &w.v_b, v, stream);
+
+    // Reshape [P, H] -> [num_windows, W, num_heads, D] (contiguous), then
+    // permute (0, 2, 1, 3) -> [num_windows, num_heads, W, D].
+    Tensor q4({num_windows, W, num_heads, D}, DType::Float16); q4.allocate();
+    Tensor k4({num_windows, W, num_heads, D}, DType::Float16); k4.allocate();
+    Tensor v4({num_windows, W, num_heads, D}, DType::Float16); v4.allocate();
+    aclrtMemcpyAsync(q4.data(), q4.size_bytes(), q.data(), q.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    aclrtMemcpyAsync(k4.data(), k4.size_bytes(), k.data(), k.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    aclrtMemcpyAsync(v4.data(), v4.size_bytes(), v.data(), v.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor qh({num_windows, num_heads, W, D}, DType::Float16); qh.allocate();
+    Tensor kh({num_windows, num_heads, W, D}, DType::Float16); kh.allocate();
+    Tensor vh({num_windows, num_heads, W, D}, DType::Float16); vh.allocate();
+    permute(q4, {0, 2, 1, 3}, qh, stream);
+    permute(k4, {0, 2, 1, 3}, kh, stream);
+    permute(v4, {0, 2, 1, 3}, vh, stream);
+
+    // Attention per-window: scores [num_windows, heads, W, W]
+    // batch_matmul needs the batch axes flattened — collapse [num_windows, heads]
+    // into a single batch dim of size num_windows*num_heads.
+    Tensor qh_flat({num_windows * num_heads, W, D}, DType::Float16); qh_flat.allocate();
+    aclrtMemcpyAsync(qh_flat.data(), qh_flat.size_bytes(), qh.data(), qh.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor kh_flat({num_windows * num_heads, W, D}, DType::Float16); kh_flat.allocate();
+    aclrtMemcpyAsync(kh_flat.data(), kh_flat.size_bytes(), kh.data(), kh.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor vh_flat({num_windows * num_heads, W, D}, DType::Float16); vh_flat.allocate();
+    aclrtMemcpyAsync(vh_flat.data(), vh_flat.size_bytes(), vh.data(), vh.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+
+    Tensor qh_scaled({num_windows * num_heads, W, D}, DType::Float16); qh_scaled.allocate();
+    muls(qh_flat, scale, qh_scaled, stream);
+    Tensor kh_t({num_windows * num_heads, D, W}, DType::Float16); kh_t.allocate();
+    permute(kh_flat, {0, 2, 1}, kh_t, stream);
+    Tensor scores({num_windows * num_heads, W, W}, DType::Float16); scores.allocate();
+    batch_matmul(qh_scaled, kh_t, scores, stream);
+
+    Tensor probs({num_windows * num_heads, W, W}, DType::Float16); probs.allocate();
+    softmax_last_dim(scores, probs, stream);
+
+    Tensor attn_flat({num_windows * num_heads, W, D}, DType::Float16); attn_flat.allocate();
+    batch_matmul(probs, vh_flat, attn_flat, stream);
+
+    // Reshape [num_windows, num_heads, W, D] back to [num_windows, W, num_heads, D] -> [P, H]
+    Tensor attn_h({num_windows, num_heads, W, D}, DType::Float16); attn_h.allocate();
+    aclrtMemcpyAsync(attn_h.data(), attn_h.size_bytes(), attn_flat.data(), attn_flat.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor attn_wnh({num_windows, W, num_heads, D}, DType::Float16); attn_wnh.allocate();
+    permute(attn_h, {0, 2, 1, 3}, attn_wnh, stream);
+    Tensor attn_2d({P, H}, DType::Float16); attn_2d.allocate();
+    aclrtMemcpyAsync(attn_2d.data(), attn_2d.size_bytes(), attn_wnh.data(), attn_wnh.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+
+    Tensor out_proj_buf({P, H}, DType::Float16); out_proj_buf.allocate();
+    linear_bias(attn_2d, w.out_proj_w, &w.out_proj_b, out_proj_buf, stream);
+
+    // Un-reorder via argsort(window_index)
+    Tensor unordered({P, H}, DType::Float16); unordered.allocate();
+    embedding_lookup(out_proj_buf, inv_index, unordered, stream);
+
+    // residual: after_attn = hidden + unordered  (reinterpret as [1, P, H])
+    Tensor after_attn({1, P, H}, DType::Float16); after_attn.allocate();
+    Tensor unordered_3d({1, P, H}, DType::Float16); unordered_3d.allocate();
+    aclrtMemcpyAsync(unordered_3d.data(), unordered_3d.size_bytes(),
+                     unordered.data(), unordered.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    add(hidden, unordered_3d, after_attn, stream);
+
+    // --- 2x2 spatial concat: view [P, H] = [merged_h, window_h, merged_w, window_w, H]
+    //     permute (0, 2, 1, 3, 4) -> [merged_h, merged_w, window_h, window_w, H]
+    //     reshape -> [num_windows, W*H]
+    Tensor after_attn_2d({P, H}, DType::Float16); after_attn_2d.allocate();
+    aclrtMemcpyAsync(after_attn_2d.data(), after_attn_2d.size_bytes(),
+                     after_attn.data(), after_attn.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor view5d({merged_h, window_h, merged_w, window_w, H}, DType::Float16); view5d.allocate();
+    aclrtMemcpyAsync(view5d.data(), view5d.size_bytes(),
+                     after_attn_2d.data(), after_attn_2d.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor view5d_perm({merged_h, merged_w, window_h, window_w, H}, DType::Float16);
+    view5d_perm.allocate();
+    permute(view5d, {0, 2, 1, 3, 4}, view5d_perm, stream);
+    // After permute the buffer is contiguous as [num_windows, W, H], which is
+    // also viewable as [num_windows, W*H].
+
+    Tensor merged_flat({num_windows, window_hidden}, DType::Float16); merged_flat.allocate();
+    aclrtMemcpyAsync(merged_flat.data(), merged_flat.size_bytes(),
+                     view5d_perm.data(), view5d_perm.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+
+    // Residual is the per-window mean: [num_windows, W, H] -> mean over W -> [num_windows, H]
+    Tensor view3d({num_windows, W, H}, DType::Float16); view3d.allocate();
+    aclrtMemcpyAsync(view3d.data(), view3d.size_bytes(),
+                     view5d_perm.data(), view5d_perm.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor residual_mean({num_windows, H}, DType::Float16); residual_mean.allocate();
+    mean(view3d, {1}, /*keep_dim=*/false, residual_mean, stream);
+
+    // pre_norm + linear_1 + GELU(tanh) + linear_2
+    Tensor pre({num_windows, window_hidden}, DType::Float16); pre.allocate();
+    layer_norm(merged_flat, w.pre_norm_w, w.pre_norm_b, pre, layer_norm_eps, stream);
+
+    const int64_t intermediate = w.linear_1_w.shape()[0];
+    Tensor lin1_out({num_windows, intermediate}, DType::Float16); lin1_out.allocate();
+    linear_bias(pre, w.linear_1_w, &w.linear_1_b, lin1_out, stream);
+
+    Tensor act({num_windows, intermediate}, DType::Float16); act.allocate();
+    gelu(lin1_out, /*tanh_approx=*/true, act, stream);
+
+    Tensor lin2_out({num_windows, H}, DType::Float16); lin2_out.allocate();
+    linear_bias(act, w.linear_2_w, &w.linear_2_b, lin2_out, stream);
+
+    // Final: out[1, num_windows, H] = lin2_out + residual_mean
+    Tensor lin2_3d({1, num_windows, H}, DType::Float16); lin2_3d.allocate();
+    aclrtMemcpyAsync(lin2_3d.data(), lin2_3d.size_bytes(),
+                     lin2_out.data(), lin2_out.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor residual_mean_3d({1, num_windows, H}, DType::Float16); residual_mean_3d.allocate();
+    aclrtMemcpyAsync(residual_mean_3d.data(), residual_mean_3d.size_bytes(),
+                     residual_mean.data(), residual_mean.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    add(lin2_3d, residual_mean_3d, out, stream);
+}
+
 }  // namespace minicpmv

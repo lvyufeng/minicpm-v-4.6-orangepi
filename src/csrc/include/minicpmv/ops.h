@@ -173,4 +173,12 @@ void permute(const Tensor& self,
 // Element-wise multiply by an fp32 scalar (cast to dtype internally).
 void muls(const Tensor& self, float scalar, Tensor& out, aclrtStream stream);
 
+// Mean over `dim` axes. If keep_dim is true, reduced axes are kept as size 1.
+// Output dtype is inferred from input (kept the same).
+void mean(const Tensor& self,
+          const std::vector<int64_t>& dims,
+          bool keep_dim,
+          Tensor& out,
+          aclrtStream stream);
+
 }  // namespace minicpmv

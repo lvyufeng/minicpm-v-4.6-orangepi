@@ -126,4 +126,19 @@ void vision_encoder_layer(const Tensor& hidden,
                           Tensor& out,
                           aclrtStream stream);
 
+// Vit merger — windowed self-attention over 2x2 patch windows + 4-patch
+// spatial concat + MLP. Reduces token count by window_h*window_w.
+//   hidden:    [1, P, H] fp16    (P = target_h * target_w)
+//   out:       [1, P/(wh*ww), H] fp16  (e.g. 1024 → 256 for 32x32 grid)
+void vision_vit_merger(const Tensor& hidden,
+                       int64_t target_h,
+                       int64_t target_w,
+                       int64_t window_h,
+                       int64_t window_w,
+                       int64_t num_heads,
+                       const VitMergerWeights& w,
+                       double layer_norm_eps,
+                       Tensor& out,
+                       aclrtStream stream);
+
 }  // namespace minicpmv
