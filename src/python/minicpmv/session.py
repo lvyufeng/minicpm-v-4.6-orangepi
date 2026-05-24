@@ -180,6 +180,11 @@ class MinicpmvSession:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+            # Disable MiniCPM-V's high-res slicing (default max_slice_nums=9
+            # creates up to ~9 sub-images per input image, which the engine's
+            # single-slice vision path doesn't yet handle). Single slice =
+            # one 32x32 patch grid = 64 image tokens.
+            max_slice_nums=1,
         )
         input_ids = inputs["input_ids"]
         if hasattr(input_ids, "tolist"):
