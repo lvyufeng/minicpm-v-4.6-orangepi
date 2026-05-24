@@ -204,6 +204,76 @@ void matmul_b_transposed(const Tensor& a, const Tensor& b, Tensor& out, aclrtStr
         return;
     }
 
+    // CANN's precompiled MatMulV2_FP16 kernel binary doesn't cover the
+    // (M >= 64, K > 4096) corner — kernel lookup returns "kernel pointer null"
+    // (errno 361001). Empirically M=32 works at any K and M=1024 works at
+    // K<=4096. For larger K we tile along the K dim, accumulate partials.
+    constexpr int64_t kKTile = 4096;
+    if (M >= 64 && K > kKTile && a.dtype() == DType::Float16 &&
+        b.dtype() == DType::Float16 && out.dtype() == DType::Float16) {
+        const int64_t num_chunks = (K + kKTile - 1) / kKTile;
+        Tensor accum({M, N}, DType::Float16); accum.allocate();
+        check_acl(aclrtMemsetAsync(accum.data(), accum.size_bytes(), 0,
+                                   accum.size_bytes(), stream),
+                  "matmul K-tile memset");
+
+        const size_t elem = dtype_size(a.dtype());
+        for (int64_t i = 0; i < num_chunks; ++i) {
+            const int64_t k_start = i * kKTile;
+            const int64_t k_chunk = std::min<int64_t>(kKTile, K - k_start);
+
+            Tensor a_chunk(std::vector<int64_t>{M, k_chunk}, a.dtype()); a_chunk.allocate();
+            // a[:, k_start : k_start+k_chunk]: copy row by row (M rows, each
+            // k_chunk*elem bytes). aclrtMemcpy2dAsync turned out to corrupt
+            // the stack on this CANN build; per-row async memcpy is fine.
+            for (int64_t r = 0; r < M; ++r) {
+                check_acl(aclrtMemcpyAsync(
+                    static_cast<uint8_t*>(a_chunk.data()) + r * k_chunk * elem,
+                    k_chunk * elem,
+                    static_cast<const uint8_t*>(a.data()) + (r * K + k_start) * elem,
+                    k_chunk * elem,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                    "matmul K-tile a row slice");
+            }
+
+            std::vector<int64_t> b_chunk_shape;
+            if (bIsTransposed) b_chunk_shape = {N, k_chunk};
+            else               b_chunk_shape = {k_chunk, N};
+            Tensor b_chunk(b_chunk_shape, b.dtype()); b_chunk.allocate();
+
+            if (bIsTransposed) {
+                // b is [N, K]; want b[:, k_start : k_start+k_chunk] → [N, k_chunk]
+                for (int64_t r = 0; r < N; ++r) {
+                    check_acl(aclrtMemcpyAsync(
+                        static_cast<uint8_t*>(b_chunk.data()) + r * k_chunk * elem,
+                        k_chunk * elem,
+                        static_cast<const uint8_t*>(b.data()) + (r * K + k_start) * elem,
+                        k_chunk * elem,
+                        ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                        "matmul K-tile b row slice (transposed)");
+                }
+            } else {
+                // b is [K, N]; want b[k_start : k_start+k_chunk, :] — contiguous block.
+                check_acl(aclrtMemcpyAsync(
+                    b_chunk.data(), b_chunk.size_bytes(),
+                    static_cast<const uint8_t*>(b.data()) + k_start * N * elem,
+                    static_cast<size_t>(k_chunk * N) * elem,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                    "matmul K-tile b slice (natural)");
+            }
+
+            Tensor partial(std::vector<int64_t>{M, N}, DType::Float16); partial.allocate();
+            matmul_b_transposed(a_chunk, b_chunk, partial, stream);
+            add(accum, partial, accum, stream);
+        }
+        check_acl(aclrtMemcpyAsync(out.data(), out.size_bytes(),
+                                   accum.data(), accum.size_bytes(),
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                  "matmul K-tile out copy");
+        check_acl(aclrtSynchronizeStream(stream), "matmul K-tile sync");
+        return;
+    }
+
     AclTensorHandle ha, hb, ho;
     make_acl_tensor(a, ha);
     make_acl_tensor(out, ho);
@@ -1224,34 +1294,28 @@ void linear_bias(const Tensor& x,
                  aclrtStream stream) {
     matmul_b_transposed(x, w, out, stream);
     if (bias == nullptr) return;
-    // Broadcast add: bias is [N], out is [..., N]. Use a fresh temp tensor as
-    // the aclnnAdd destination to avoid aliasing — some ACL versions appear
-    // to leave a kernel-cache slot in a bad state when aclnnAdd's input and
-    // output point at the same buffer, which then breaks subsequent aclnnMm
-    // calls with "kernel pointer null".
+    // Broadcast add: bias is [N], out is [..., N]. Use aclnnInplaceAdd which
+    // is the dedicated in-place add API (avoids the kernel-cache corruption
+    // we saw when aliasing input and output through plain aclnnAdd).
     if (bias->dtype() != DType::Float16) throw std::runtime_error("linear_bias bias must be fp16");
     if (bias->shape().size() != 1 || bias->shape()[0] != out.shape().back()) {
         throw std::runtime_error("linear_bias bias must be [N] matching out last dim");
     }
-    Tensor tmp(out.shape(), out.dtype()); tmp.allocate();
-    aclrtMemcpyAsync(tmp.data(), tmp.size_bytes(), out.data(), out.size_bytes(),
-                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
-    AclTensorHandle ha, hb, ho;
-    make_acl_tensor(tmp, ha);
-    make_acl_tensor(*bias, hb);
+    AclTensorHandle ho, hb;
     make_acl_tensor(out, ho);
+    make_acl_tensor(*bias, hb);
     float alpha_value = 1.0f;
     aclScalar* alpha = aclCreateScalar(&alpha_value, ACL_FLOAT);
     if (alpha == nullptr) throw std::runtime_error("linear_bias aclCreateScalar failed");
     uint64_t ws_size = 0;
     aclOpExecutor* executor = nullptr;
-    auto ret = aclnnAddGetWorkspaceSize(ha.tensor, hb.tensor, alpha, ho.tensor, &ws_size, &executor);
+    auto ret = aclnnInplaceAddGetWorkspaceSize(ho.tensor, hb.tensor, alpha, &ws_size, &executor);
     if (ret != 0) {
         aclDestroyScalar(alpha);
-        throw std::runtime_error("linear_bias aclnnAddGetWorkspaceSize failed: " + std::to_string(ret));
+        throw std::runtime_error("linear_bias aclnnInplaceAddGetWorkspaceSize failed: " + std::to_string(ret));
     }
     try {
-        run_op("aclnnAdd_bias", ws_size, executor, stream, aclnnAdd);
+        run_op("aclnnInplaceAdd_bias", ws_size, executor, stream, aclnnInplaceAdd);
     } catch (...) {
         aclDestroyScalar(alpha);
         throw;

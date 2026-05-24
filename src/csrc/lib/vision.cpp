@@ -2,6 +2,7 @@
 #include "minicpmv/acl_context.h"
 #include "minicpmv/ops.h"
 
+#include <acl/acl_rt.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -234,14 +235,9 @@ void vision_encoder_layer(const Tensor& hidden,
     linear_bias(ln1_2d, w.k_w, &w.k_b, k, stream);
     linear_bias(ln1_2d, w.v_w, &w.v_b, v, stream);
 
-    // -- reshape and permute to [heads, T, D]:
-    //    q.view(T, heads, D) → permute(1, 0, 2)
-    // For aclnnPermute we declare q as [T, heads, D]; create a fresh dest of
-    // shape [heads, T, D] and use permute(1, 0, 2).
     Tensor q3({T, num_heads, D}, DType::Float16);
     Tensor k3({T, num_heads, D}, DType::Float16);
     Tensor v3({T, num_heads, D}, DType::Float16);
-    // q,k,v buffers already hold [T, heads*D] = [T, heads, D] in row-major.
     q3.allocate(); aclrtMemcpyAsync(q3.data(), q3.size_bytes(), q.data(), q.size_bytes(),
                                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
     k3.allocate(); aclrtMemcpyAsync(k3.data(), k3.size_bytes(), k.data(), k.size_bytes(),
@@ -255,8 +251,6 @@ void vision_encoder_layer(const Tensor& hidden,
     permute(k3, {1, 0, 2}, kh, stream);
     permute(v3, {1, 0, 2}, vh, stream);
 
-    // -- attention scores = qh @ kh^T * scale  → [heads, T, T]
-    // Scale qh first so the bmm output is already scaled.
     Tensor qh_scaled({num_heads, T, D}, DType::Float16); qh_scaled.allocate();
     muls(qh, scale, qh_scaled, stream);
     Tensor kh_t({num_heads, D, T}, DType::Float16); kh_t.allocate();
@@ -264,11 +258,9 @@ void vision_encoder_layer(const Tensor& hidden,
     Tensor scores({num_heads, T, T}, DType::Float16); scores.allocate();
     batch_matmul(qh_scaled, kh_t, scores, stream);
 
-    // -- softmax along last dim
     Tensor probs({num_heads, T, T}, DType::Float16); probs.allocate();
     softmax_last_dim(scores, probs, stream);
 
-    // -- attn = probs @ vh   → [heads, T, D]
     Tensor attn_h({num_heads, T, D}, DType::Float16); attn_h.allocate();
     batch_matmul(probs, vh, attn_h, stream);
     Tensor attn_thd({T, num_heads, D}, DType::Float16); attn_thd.allocate();
@@ -278,25 +270,19 @@ void vision_encoder_layer(const Tensor& hidden,
                      attn_thd.data(), attn_thd.size_bytes(),
                      ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
 
-    // -- out_proj + bias
     Tensor attn_out({T, H}, DType::Float16); attn_out.allocate();
     linear_bias(attn_th, w.out_proj_w, &w.out_proj_b, attn_out, stream);
 
-    // -- residual: out = hidden + attn_out (broadcast view of [1, T, H])
     Tensor after_attn({B, T, H}, DType::Float16); after_attn.allocate();
-    // hidden is [1, T, H], attn_out is [T, H]. Add element-wise — they share
-    // total layout. Reinterpret attn_out as [1, T, H] and use add().
     Tensor attn_out_3d({B, T, H}, DType::Float16); attn_out_3d.allocate();
     aclrtMemcpyAsync(attn_out_3d.data(), attn_out_3d.size_bytes(),
                      attn_out.data(), attn_out.size_bytes(),
                      ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
     add(hidden, attn_out_3d, after_attn, stream);
 
-    // -- pre-MLP LN
     Tensor ln2({B, T, H}, DType::Float16); ln2.allocate();
     layer_norm(after_attn, w.layer_norm2_w, w.layer_norm2_b, ln2, layer_norm_eps, stream);
 
-    // -- MLP: fc1 + gelu + fc2 (all on [T, H])
     Tensor ln2_2d({T, H}, DType::Float16); ln2_2d.allocate();
     aclrtMemcpyAsync(ln2_2d.data(), ln2_2d.size_bytes(),
                      ln2.data(), ln2.size_bytes(),
