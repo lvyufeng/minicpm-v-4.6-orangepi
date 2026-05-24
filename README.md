@@ -112,6 +112,26 @@ python3 src/python/run_hybrid.py \
 python3 src/python/compare_logits.py
 ```
 
+### Web UI (Gradio)
+
+A streaming chat + vision UI is available for interactive testing:
+
+```bash
+# One-time: install Gradio in your Python env.
+pip install gradio pillow
+
+# Launch (loads the HF model + processor once at startup, ~60s on cold start).
+source scripts/set_env.sh
+python3 src/python/gradio_app.py
+
+# Then open http://localhost:7860 in a browser. Pass --share to publish a
+# temporary public URL via gradio's tunnel.
+```
+
+The UI is multimodal: drop an image into the message box alongside your text
+to ask vision questions. Each response streams token-by-token and shows
+time-to-first-token and decode tokens/s at the bottom of the reply.
+
 For unit tests and the full bench suite, see [Diagnostics](#diagnostics).
 
 ## Key optimizations

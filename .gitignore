@@ -40,3 +40,4 @@ src/csrc/custom_ops/test_rms_norm1024_aclnn
 ._____temp
 *.tmp
 /bench/bench_ddr_bandwidth
+kernel_meta/
