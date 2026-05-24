@@ -126,6 +126,38 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
             lw.k_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.k_norm.weight");
         }
     }
+
+    // Pre-build cube-friendly lm_head chunks: [K=hidden, N=16384] per slice,
+    // padded with zero columns if the tail vocab piece is smaller. Cube path
+    // requires N <= 16384 and N % 128 == 0, so a uniform 16384-wide chunk
+    // keeps every slice on the fast path. Padded columns produce a 0 logit
+    // that lm_head_greedy ignores by clipping to start_vocab + valid_n.
+    constexpr int64_t kChunkN = 16384;
+    const int64_t H = cfg.hidden_size;
+    const int64_t V = cfg.vocab_size;
+    if (w.embed.shape().size() != 2 || w.embed.shape()[0] != V || w.embed.shape()[1] != H) {
+        throw std::runtime_error("embed weight shape unexpected for lm_head chunking");
+    }
+    std::vector<uint16_t> embed_host(static_cast<size_t>(V) * H);
+    w.embed.copy_to_host(embed_host.data(), embed_host.size() * sizeof(uint16_t));
+    std::vector<uint16_t> chunk_host(static_cast<size_t>(H) * kChunkN);
+    for (int64_t start = 0; start < V; start += kChunkN) {
+        const int64_t valid = std::min<int64_t>(kChunkN, V - start);
+        std::fill(chunk_host.begin(), chunk_host.end(), uint16_t{0});
+        for (int64_t n = 0; n < valid; ++n) {
+            const int64_t row = start + n;
+            for (int64_t k = 0; k < H; ++k) {
+                chunk_host[static_cast<size_t>(k) * kChunkN + n] =
+                    embed_host[static_cast<size_t>(row) * H + k];
+            }
+        }
+        LmHeadChunk chunk;
+        chunk.start_vocab = start;
+        chunk.weight_kn = Tensor({H, kChunkN}, DType::Float16);
+        chunk.weight_kn.copy_from_host(chunk_host.data(), chunk_host.size() * sizeof(uint16_t));
+        w.lm_head_chunks.push_back(std::move(chunk));
+    }
+
     return w;
 }
 
@@ -264,15 +296,50 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
     if (last_hidden_1xH.shape() != std::vector<int64_t>{1, cfg.hidden_size}) {
         throw std::runtime_error("lm_head_greedy hidden must be [1, hidden_size]");
     }
+    if (w.lm_head_chunks.empty()) {
+        throw std::runtime_error("lm_head_greedy missing pre-built chunks");
+    }
     Tensor normed({1, cfg.hidden_size}, DType::Float16); normed.allocate();
     rms_norm(last_hidden_1xH, w.final_norm_w, normed, cfg.rms_epsilon, stream);
-    Tensor logits({1, cfg.vocab_size}, DType::Float16); logits.allocate();
-    matmul_b_transposed(normed, w.embed, logits, stream);
-    Tensor pred({1}, DType::Int64); pred.allocate();
-    argmax_last_dim(logits, pred, stream);
-    int64_t out = 0;
-    pred.copy_to_host(&out, sizeof(out));
-    return out;
+
+    // Reusable per-chunk logits buffer and host scratch for the D2H read.
+    const int64_t kChunkN = w.lm_head_chunks.front().weight_kn.shape()[1];
+    Tensor logits({1, kChunkN}, DType::Float16); logits.allocate();
+    std::vector<uint16_t> logits_host(static_cast<size_t>(kChunkN));
+
+    auto h2f = [](uint16_t h) -> float {
+        uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+        uint32_t exp = (h >> 10) & 0x1fu;
+        uint32_t mant = h & 0x03ffu;
+        uint32_t out;
+        if (exp == 0) {
+            out = sign;
+        } else if (exp == 31) {
+            out = sign | 0x7f800000u | (mant << 13);
+        } else {
+            out = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+        float f;
+        std::memcpy(&f, &out, sizeof(f));
+        return f;
+    };
+
+    int64_t best_token = 0;
+    float best_logit = -std::numeric_limits<float>::infinity();
+
+    for (const auto& chunk : w.lm_head_chunks) {
+        matmul_b_transposed(normed, chunk.weight_kn, logits, stream);
+        logits.copy_to_host(logits_host.data(), logits_host.size() * sizeof(uint16_t));
+        const int64_t valid = std::min<int64_t>(kChunkN, cfg.vocab_size - chunk.start_vocab);
+        for (int64_t i = 0; i < valid; ++i) {
+            float v = h2f(logits_host[static_cast<size_t>(i)]);
+            if (v > best_logit) {
+                best_logit = v;
+                best_token = chunk.start_vocab + i;
+            }
+        }
+    }
+    return best_token;
 }
 
 int64_t decode_step_greedy(int32_t token_id,

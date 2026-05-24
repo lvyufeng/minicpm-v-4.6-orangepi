@@ -52,10 +52,17 @@ struct LanguageModelLayerWeights {
     Tensor k_norm_w;
 };
 
+struct LmHeadChunk {
+    int64_t start_vocab{0};
+    // Pre-transposed [K=hidden_size, N=chunk_vocab] fp16 cube-safe chunk.
+    Tensor weight_kn;
+};
+
 struct LanguageModelWeights {
     Tensor embed;
     Tensor final_norm_w;
     std::vector<LanguageModelLayerWeights> layers;
+    std::vector<LmHeadChunk> lm_head_chunks;
 };
 
 LanguageModelWeights load_language_model_weights(WeightsIndex& index,
