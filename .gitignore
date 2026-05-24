@@ -8,10 +8,9 @@ ms_probe/
 *.om
 
 # Build outputs
-build_out/
+/build/
 custom_opp_install/
-custom_ops/build_out/
-engine/build/
+src/csrc/custom_ops/build_out/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake
@@ -24,7 +23,7 @@ engine/build/
 __pycache__/
 *.pyc
 
-# Logs and generated probes
+# Logs and exploratory scripts not under source control
 *.log
 fusion_result.json
 profile_*.py
@@ -33,8 +32,8 @@ smoke_npu_fused_ops.py
 test_npu_*.py
 test_rope_infer_ops.py
 test_image.png
-custom_ops/test_add_custom_aclnn
-custom_ops/test_rms_norm1024_aclnn
+src/csrc/custom_ops/test_add_custom_aclnn
+src/csrc/custom_ops/test_rms_norm1024_aclnn
 
 # Local/editor noise
 .cache/
