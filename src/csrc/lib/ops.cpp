@@ -17,6 +17,10 @@
 #include <aclnnop/aclnn_mean.h>
 #include <aclnnop/aclnn_rsqrt.h>
 #include <aclnnop/aclnn_sub.h>
+#include <aclnnop/aclnn_convolution.h>
+#include <aclnnop/aclnn_gelu_v2.h>
+#include <aclnnop/aclnn_batch_matmul.h>
+#include <aclnnop/aclnn_permute.h>
 #include "aclnn_rms_norm1024_custom.h"
 #include "aclnn_linear_causal_conv_custom.h"
 #include "aclnn_linear_causal_conv_step_custom.h"
@@ -1086,6 +1090,230 @@ void gated_rms_norm_z(const Tensor& core,
         throw std::runtime_error("aclnnGatedRmsNormZCustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
     run_op("aclnnGatedRmsNormZCustom", ws_size, executor, stream, aclnnGatedRmsNormZCustom);
+}
+
+// ---- Vision encoder building blocks (Conv2d, GELU, BatchMatMul, linear+bias) ----
+
+void conv2d(const Tensor& input,
+            const Tensor& weight,
+            const Tensor* bias,
+            const std::vector<int64_t>& stride,
+            const std::vector<int64_t>& padding,
+            Tensor& out,
+            aclrtStream stream) {
+    if (input.dtype() != DType::Float16 || weight.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("conv2d requires fp16 tensors");
+    }
+    if (bias != nullptr && bias->dtype() != DType::Float16) {
+        throw std::runtime_error("conv2d bias must be fp16");
+    }
+    if (input.shape().size() != 4 || weight.shape().size() != 4 || out.shape().size() != 4) {
+        throw std::runtime_error("conv2d expects 4D NCHW tensors");
+    }
+    if (stride.size() != 2 || padding.size() != 2) {
+        throw std::runtime_error("conv2d stride/padding must be size 2 (H, W)");
+    }
+
+    auto make_nchw = [](const Tensor& t, AclTensorHandle& h) {
+        h.view_dims = t.shape();
+        h.storage_dims = t.shape();
+        h.strides.assign(t.shape().size(), 1);
+        for (int i = static_cast<int>(t.shape().size()) - 2; i >= 0; --i) {
+            h.strides[i] = h.strides[i + 1] * t.shape()[i + 1];
+        }
+        h.tensor = aclCreateTensor(
+            h.view_dims.data(), h.view_dims.size(), to_acl_dtype(t.dtype()),
+            h.strides.data(), 0, ACL_FORMAT_NCHW,
+            h.storage_dims.data(), h.storage_dims.size(),
+            t.data());
+        if (h.tensor == nullptr) throw std::runtime_error("conv2d aclCreateTensor (NCHW) returned null");
+    };
+
+    AclTensorHandle hi, hw, hb, ho;
+    make_nchw(input, hi);
+    make_nchw(weight, hw);
+    make_nchw(out, ho);
+    if (bias != nullptr) {
+        make_acl_tensor(*bias, hb);  // bias is 1D ND
+    }
+
+    aclIntArray* stride_arr = aclCreateIntArray(stride.data(), stride.size());
+    aclIntArray* pad_arr = aclCreateIntArray(padding.data(), padding.size());
+    std::vector<int64_t> dilation_vec{1, 1};
+    aclIntArray* dilation_arr = aclCreateIntArray(dilation_vec.data(), dilation_vec.size());
+    std::vector<int64_t> output_pad_vec{0, 0};
+    aclIntArray* output_pad_arr = aclCreateIntArray(output_pad_vec.data(), output_pad_vec.size());
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr int8_t kCubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION
+    auto ret = aclnnConvolutionGetWorkspaceSize(
+        hi.tensor, hw.tensor,
+        bias != nullptr ? hb.tensor : nullptr,
+        stride_arr, pad_arr, dilation_arr,
+        /*transposed=*/false, output_pad_arr, /*groups=*/1,
+        ho.tensor, kCubeMathType, &ws_size, &executor);
+    if (ret != 0) {
+        aclDestroyIntArray(stride_arr); aclDestroyIntArray(pad_arr);
+        aclDestroyIntArray(dilation_arr); aclDestroyIntArray(output_pad_arr);
+        throw std::runtime_error("aclnnConvolutionGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnConvolution", ws_size, executor, stream, aclnnConvolution);
+    aclDestroyIntArray(stride_arr);
+    aclDestroyIntArray(pad_arr);
+    aclDestroyIntArray(dilation_arr);
+    aclDestroyIntArray(output_pad_arr);
+}
+
+void gelu(const Tensor& self, bool tanh_approx, Tensor& out, aclrtStream stream) {
+    if (self.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("gelu requires fp16 tensors");
+    }
+    if (self.shape() != out.shape()) {
+        throw std::runtime_error("gelu shape mismatch");
+    }
+    AclTensorHandle hs, ho;
+    make_acl_tensor(self, hs);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    const int64_t approximate = tanh_approx ? 1 : 0;
+    auto ret = aclnnGeluV2GetWorkspaceSize(hs.tensor, approximate, ho.tensor, &ws_size, &executor);
+    if (ret != 0) throw std::runtime_error("aclnnGeluV2GetWorkspaceSize failed: " + std::to_string(ret));
+    run_op("aclnnGeluV2", ws_size, executor, stream, aclnnGeluV2);
+}
+
+void batch_matmul(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream) {
+    if (a.dtype() != DType::Float16 || b.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("batch_matmul requires fp16 tensors");
+    }
+    if (a.shape().size() < 3 || b.shape().size() != a.shape().size() || out.shape().size() != a.shape().size()) {
+        throw std::runtime_error("batch_matmul tensors must share rank >= 3");
+    }
+    const int64_t r = a.shape().size();
+    if (a.shape()[r - 1] != b.shape()[r - 2]) {
+        throw std::runtime_error("batch_matmul inner dims mismatch");
+    }
+    if (out.shape()[r - 2] != a.shape()[r - 2] || out.shape()[r - 1] != b.shape()[r - 1]) {
+        throw std::runtime_error("batch_matmul out shape mismatch");
+    }
+    for (int64_t i = 0; i < r - 2; ++i) {
+        if (a.shape()[i] != b.shape()[i] || a.shape()[i] != out.shape()[i]) {
+            throw std::runtime_error("batch_matmul batch dims must broadcast-match");
+        }
+    }
+
+    AclTensorHandle ha, hb, ho;
+    make_acl_tensor(a, ha);
+    make_acl_tensor(b, hb);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr int8_t kCubeMathType = 1;
+    auto ret = aclnnBatchMatMulGetWorkspaceSize(ha.tensor, hb.tensor, ho.tensor, kCubeMathType, &ws_size, &executor);
+    if (ret != 0) throw std::runtime_error("aclnnBatchMatMulGetWorkspaceSize failed: " + std::to_string(ret));
+    run_op("aclnnBatchMatMul", ws_size, executor, stream, aclnnBatchMatMul);
+}
+
+void linear_bias(const Tensor& x,
+                 const Tensor& w,
+                 const Tensor* bias,
+                 Tensor& out,
+                 aclrtStream stream) {
+    matmul_b_transposed(x, w, out, stream);
+    if (bias == nullptr) return;
+    // Broadcast add: bias is [N], out is [..., N]. Use a fresh temp tensor as
+    // the aclnnAdd destination to avoid aliasing — some ACL versions appear
+    // to leave a kernel-cache slot in a bad state when aclnnAdd's input and
+    // output point at the same buffer, which then breaks subsequent aclnnMm
+    // calls with "kernel pointer null".
+    if (bias->dtype() != DType::Float16) throw std::runtime_error("linear_bias bias must be fp16");
+    if (bias->shape().size() != 1 || bias->shape()[0] != out.shape().back()) {
+        throw std::runtime_error("linear_bias bias must be [N] matching out last dim");
+    }
+    Tensor tmp(out.shape(), out.dtype()); tmp.allocate();
+    aclrtMemcpyAsync(tmp.data(), tmp.size_bytes(), out.data(), out.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    AclTensorHandle ha, hb, ho;
+    make_acl_tensor(tmp, ha);
+    make_acl_tensor(*bias, hb);
+    make_acl_tensor(out, ho);
+    float alpha_value = 1.0f;
+    aclScalar* alpha = aclCreateScalar(&alpha_value, ACL_FLOAT);
+    if (alpha == nullptr) throw std::runtime_error("linear_bias aclCreateScalar failed");
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnAddGetWorkspaceSize(ha.tensor, hb.tensor, alpha, ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        aclDestroyScalar(alpha);
+        throw std::runtime_error("linear_bias aclnnAddGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    try {
+        run_op("aclnnAdd_bias", ws_size, executor, stream, aclnnAdd);
+    } catch (...) {
+        aclDestroyScalar(alpha);
+        throw;
+    }
+    aclDestroyScalar(alpha);
+}
+
+void permute(const Tensor& self,
+             const std::vector<int64_t>& dims,
+             Tensor& out,
+             aclrtStream stream) {
+    if (self.dtype() != out.dtype()) throw std::runtime_error("permute dtype mismatch");
+    if (dims.size() != self.shape().size()) throw std::runtime_error("permute dims rank mismatch");
+    for (size_t i = 0; i < dims.size(); ++i) {
+        if (out.shape()[i] != self.shape()[dims[i]]) {
+            throw std::runtime_error("permute out shape mismatch");
+        }
+    }
+    AclTensorHandle hs, ho;
+    make_acl_tensor(self, hs);
+    make_acl_tensor(out, ho);
+    aclIntArray* dims_arr = aclCreateIntArray(dims.data(), dims.size());
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnPermuteGetWorkspaceSize(hs.tensor, dims_arr, ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        aclDestroyIntArray(dims_arr);
+        throw std::runtime_error("aclnnPermuteGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    try {
+        run_op("aclnnPermute", ws_size, executor, stream, aclnnPermute);
+    } catch (...) {
+        aclDestroyIntArray(dims_arr);
+        throw;
+    }
+    aclDestroyIntArray(dims_arr);
+}
+
+void muls(const Tensor& self, float scalar, Tensor& out, aclrtStream stream) {
+    if (self.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("muls requires fp16 tensors");
+    }
+    if (self.shape() != out.shape()) throw std::runtime_error("muls shape mismatch");
+    AclTensorHandle hs, ho;
+    make_acl_tensor(self, hs);
+    make_acl_tensor(out, ho);
+    aclScalar* s = aclCreateScalar(&scalar, ACL_FLOAT);
+    if (s == nullptr) throw std::runtime_error("muls aclCreateScalar failed");
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnMulsGetWorkspaceSize(hs.tensor, s, ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        aclDestroyScalar(s);
+        throw std::runtime_error("aclnnMulsGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    try {
+        run_op("aclnnMuls", ws_size, executor, stream, aclnnMuls);
+    } catch (...) {
+        aclDestroyScalar(s);
+        throw;
+    }
+    aclDestroyScalar(s);
 }
 
 }  // namespace minicpmv

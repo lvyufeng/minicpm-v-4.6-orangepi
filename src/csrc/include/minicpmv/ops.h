@@ -130,4 +130,47 @@ void gated_rms_norm_z(const Tensor& core,
                       Tensor& out,
                       aclrtStream stream);
 
+// 2D convolution. input: [N, Cin, H, W] fp16, weight: [Cout, Cin/groups, kH, kW] fp16,
+// optional bias: [Cout] fp16. stride/padding are size-2 vectors (H, W).
+// dilation defaults to {1,1} and groups defaults to 1 — set explicitly for
+// other patterns. out: [N, Cout, H', W'] where H', W' are derived from input.
+void conv2d(const Tensor& input,
+            const Tensor& weight,
+            const Tensor* bias,
+            const std::vector<int64_t>& stride,
+            const std::vector<int64_t>& padding,
+            Tensor& out,
+            aclrtStream stream);
+
+// GELU activation. `tanh` selects between the exact (false) and
+// tanh-approximation (true) variants used by `gelu_pytorch_tanh`.
+// Same shape in / out. fp16.
+void gelu(const Tensor& self, bool tanh_approx, Tensor& out, aclrtStream stream);
+
+// Batched matrix multiply: out[b, m, n] = sum_k a[b, m, k] * b[b, k, n].
+// Supports any batch rank >= 1; the last two dims are the matmul.
+void batch_matmul(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream);
+
+// Linear with bias: out = x @ W^T + bias.
+//   x:    [M, K] fp16
+//   w:    [N, K] fp16 (or [K, N] natural — matches matmul_b_transposed semantics)
+//   bias: [N]   fp16 (broadcast across rows). Pass nullptr to skip the add.
+//   out:  [M, N] fp16
+// Convenience wrapper around matmul_b_transposed + optional broadcast add.
+void linear_bias(const Tensor& x,
+                 const Tensor& w,
+                 const Tensor* bias,
+                 Tensor& out,
+                 aclrtStream stream);
+
+// Permute (transpose) self's axes by `dims`. out's shape must be
+// `[self.shape()[dims[0]], self.shape()[dims[1]], ...]`.
+void permute(const Tensor& self,
+             const std::vector<int64_t>& dims,
+             Tensor& out,
+             aclrtStream stream);
+
+// Element-wise multiply by an fp32 scalar (cast to dtype internally).
+void muls(const Tensor& self, float scalar, Tensor& out, aclrtStream stream);
+
 }  // namespace minicpmv

@@ -25,6 +25,7 @@ add_library(minicpmv_engine
   src/csrc/lib/ops.cpp
   src/csrc/lib/decoder_layer.cpp
   src/csrc/lib/language_model.cpp
+  src/csrc/lib/vision.cpp
 )
 
 target_include_directories(minicpmv_engine PUBLIC
