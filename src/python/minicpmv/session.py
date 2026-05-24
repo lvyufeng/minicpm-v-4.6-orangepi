@@ -1,13 +1,16 @@
 """Reusable MiniCPM-V 4.6 session: the C++ engine binary
 `minicpmv_hybrid_decode` runs in `--server` mode and handles every NPU op
-(embedding lookup, prefill, decode). Python only does CPU-side prompt
-tokenization via HF AutoProcessor — no torch_npu dependency, no HF model on
-NPU. This avoids the 30-50s torch_npu per-shape JIT compile that used to
-dominate first-call latency in the chat UX.
+(embedding lookup, vision tower, prefill, decode). Python only does
+CPU-side prompt tokenization + image preprocessing via HF AutoProcessor
+— no torch_npu dependency, no HF model on NPU. This avoids the 30-50s
+torch_npu per-shape JIT compile that used to dominate first-call latency
+in the chat UX.
 
-For multimodal (image) inputs the Python side currently raises — see TODO at
-the top of `_prepare_inputs_embeds` for how to add CPU- or engine-side
-vision support later.
+Image inputs route the HF processor's `pixel_values` (naflex patch-strip
+layout) + `target_sizes` straight through to the engine; the engine runs
+the full SigLIP vision tower + merger and scatters the resulting image
+features into the prompt at the `image_token_id` positions before
+prefill.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from transformers import AutoProcessor
 
@@ -38,19 +41,27 @@ LAYER_TYPES = [
 EOS_TOKEN_IDS = [248044, 248046]
 VOCAB_SIZE = 248094
 HIDDEN_SIZE = 1024
+IMAGE_TOKEN_ID = 248056
+
+
+def _dtype_fp16():
+    # imported lazily so the module's only hard dep is `transformers`
+    import torch
+    return torch.float16
 
 
 class MinicpmvSession:
     """Holds the HF processor (CPU-only) + a persistent engine subprocess.
 
-    Construction loads the tokenizer + chat template via AutoProcessor (CPU
+    Construction loads the tokenizer + image processor via AutoProcessor (CPU
     only, no model weights, no NPU). The engine binary in --server mode owns
     the model on the NPU; per request the Python side only tokenizes the
-    chat-template'd prompt and ships the integer token ids to the engine.
+    chat-template'd prompt (and CPU-preprocesses any images) and ships the
+    integer token ids + raw pixel bytes to the engine.
 
-    Image inputs currently raise NotImplementedError — see the module
-    docstring for how to add vision support later without re-introducing the
-    torch_npu dependency.
+    Pass with_vision=True to spawn the engine with vision weights loaded so
+    image messages work. Text-only sessions can keep with_vision=False to
+    save the ~1.5 GB NPU vision-weight load.
     """
 
     def __init__(
@@ -58,18 +69,18 @@ class MinicpmvSession:
         model_path: Optional[str] = None,
         engine_bin: Optional[str] = None,
         custom_opp: Optional[str] = None,
+        with_vision: bool = True,
     ) -> None:
         self.model_path = model_path or os.environ.get("MINICPMV_MODEL_PATH", DEFAULT_MODEL_PATH)
         self.engine_bin = engine_bin or os.environ.get("MINICPMV_ENGINE_BIN", DEFAULT_ENGINE_BIN)
         self.custom_opp = custom_opp or os.environ.get("MINICPMV_CUSTOM_OPP", DEFAULT_CUSTOM_OPP)
+        self.with_vision = with_vision
 
-        # CPU-only tokenizer + chat template. AutoProcessor downloads the
-        # image processor config too, but we don't touch any NPU op here.
+        # CPU-only processor: tokenizer + chat template + image processor.
+        # Holds no model weights, never touches the NPU.
         self.processor = AutoProcessor.from_pretrained(self.model_path)
 
-        # Persistent engine subprocess in --server mode. Lazily spawned on
-        # first generate() call so __init__ doesn't trip on a missing binary
-        # during e.g. dataset prep.
+        # Persistent engine subprocess in --server mode.
         self._engine_proc: Optional[subprocess.Popen] = None
 
     def close(self) -> None:
@@ -108,67 +119,111 @@ class MinicpmvSession:
         Args:
             messages: HF chat-template format, e.g.
                 [{"role": "user", "content": [{"type": "text", "text": "hi"}]},
-                 {"role": "assistant", "content": [{"type": "text", "text": "..."}]},
-                 {"role": "user", "content": [{"type": "text", "text": "..."}]}]
-                Image parts are currently rejected.
+                 {"role": "user", "content": [{"type": "image", "url": "/path/to.png"},
+                                              {"type": "text", "text": "describe"}]},
+                 ...]
             max_new_tokens: hard cap on generated tokens (engine will also stop on EOS).
 
         Yields:
             (token_id, decoded_text_chunk, stats) per token. Stats is a dict
             with token_count, elapsed_s, decode_s, tps for the current stream.
         """
-        input_ids = self._prepare_input_ids(messages)
-        bundle_json = self._write_bundle(input_ids, max_new_tokens)
+        prepared = self._prepare_inputs(messages)
+        bundle_json, side_paths = self._write_bundle(prepared, max_new_tokens)
         try:
             yield from self._run_engine_streaming(bundle_json)
         finally:
-            try:
-                os.remove(bundle_json)
-            except OSError:
-                pass
+            for p in [bundle_json, *side_paths]:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     # ----- Internals --------------------------------------------------------
 
-    def _prepare_input_ids(self, messages: List[Dict]) -> List[int]:
-        # TODO: image support without torch_npu. Options:
-        #   (1) run the HF SiglipVisionModel on CPU (slow but no NPU dep) and
-        #       insert resulting features into the bundle as a separate
-        #       embeddings-by-position override.
-        #   (2) port the vision encoder + image-to-token-features projection
-        #       into the C++ engine.
-        # For now any image part raises so the UX surface stays honest.
+    def _prepare_inputs(self, messages: List[Dict]) -> Dict[str, Any]:
+        """Run the HF processor (CPU) and return a normalised dict of bytes
+        ready for the bundle:
+            {
+              'input_ids': List[int],
+              'pixel_values': Optional[bytes],     # fp16 little-endian, naflex
+              'target_h': Optional[int],
+              'target_w': Optional[int],
+            }
+        Only the first image in the message stream is currently handled.
+        """
+        # Reject unsupported part types (audio/video) early.
         for m in messages:
             content = m.get("content")
             if isinstance(content, list):
                 for p in content:
-                    if isinstance(p, dict) and p.get("type") not in (None, "text"):
-                        raise NotImplementedError(
-                            f"non-text content part {p.get('type')!r} not supported in "
-                            "torch_npu-free mode; text only for now"
-                        )
+                    if isinstance(p, dict):
+                        kind = p.get("type")
+                        if kind not in (None, "text", "image"):
+                            raise NotImplementedError(
+                                f"content part type {kind!r} not supported")
 
-        # apply_chat_template is CPU-only (tokenizer ops). No tensors moved
-        # to NPU here; we read input_ids straight off the CPU list.
+        has_image = any(
+            isinstance(p, dict) and p.get("type") == "image"
+            for m in messages
+            if isinstance(m.get("content"), list)
+            for p in m["content"]
+        )
+        if has_image and not self.with_vision:
+            raise RuntimeError("session was constructed with with_vision=False but "
+                               "messages contain an image; recreate the session "
+                               "with with_vision=True")
+
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
+            return_tensors="pt",
         )
         input_ids = inputs["input_ids"]
         if hasattr(input_ids, "tolist"):
             ids_list = input_ids[0].tolist() if hasattr(input_ids[0], "tolist") else list(input_ids[0])
         else:
             ids_list = list(input_ids[0]) if isinstance(input_ids[0], (list, tuple)) else list(input_ids)
-        return [int(x) for x in ids_list]
+        ids_list = [int(x) for x in ids_list]
 
-    def _write_bundle(self, input_ids: List[int], max_new_tokens: int) -> str:
+        result: Dict[str, Any] = {"input_ids": ids_list}
+        pixel_values = inputs.get("pixel_values")
+        target_sizes = inputs.get("target_sizes")
+        if has_image and pixel_values is not None and target_sizes is not None:
+            # Only the first image (single-image conversations); multi-image
+            # would require iterating per-image and stitching scatter offsets.
+            import numpy as np
+            pv = pixel_values
+            if hasattr(pv, "to") and hasattr(pv, "numpy"):
+                pv_np = pv[:1].to("cpu").contiguous().to(_dtype_fp16()).numpy()
+            else:
+                pv_np = np.ascontiguousarray(pv).astype(np.float16)
+            ts = target_sizes
+            if hasattr(ts, "tolist"):
+                target_h, target_w = int(ts[0][0]), int(ts[0][1])
+            else:
+                target_h, target_w = int(ts[0][0]), int(ts[0][1])
+            result["pixel_values"] = pv_np.tobytes()
+            result["target_h"] = target_h
+            result["target_w"] = target_w
+        return result
+
+    def _write_bundle(
+        self,
+        prepared: Dict[str, Any],
+        max_new_tokens: int,
+    ) -> Tuple[str, List[str]]:
+        input_ids = prepared["input_ids"]
         seq_len = len(input_ids)
         prefix = os.path.join(
             tempfile.gettempdir(),
             f"minicpmv_{os.getpid()}_{int(time.time() * 1000)}",
         )
         json_path = prefix + ".json"
+        side_paths: List[str] = []
+
         bundle = {
             "version": 1,
             "seq_len": seq_len,
@@ -178,16 +233,25 @@ class MinicpmvSession:
             "vocab_size": VOCAB_SIZE,
             "eos_token_ids": EOS_TOKEN_IDS,
             "layer_types": LAYER_TYPES,
-            # No embeddings file — engine does embedding lookup from input_ids.
             "embeddings_dtype": "float16",
             "embeddings_endianness": "little",
-            "embeddings_path": "",
+            "embeddings_path": "",  # engine does embedding lookup from input_ids
             "weights_path": os.path.join(self.model_path, "model.safetensors"),
             "input_ids": input_ids,
         }
+        if "pixel_values" in prepared:
+            pixels_path = prefix + ".pixels.f16"
+            with open(pixels_path, "wb") as f:
+                f.write(prepared["pixel_values"])
+            side_paths.append(pixels_path)
+            bundle["image_pixels_path"] = pixels_path
+            bundle["image_target_h"] = prepared["target_h"]
+            bundle["image_target_w"] = prepared["target_w"]
+            bundle["image_token_id"] = IMAGE_TOKEN_ID
+
         with open(json_path, "w") as f:
             json.dump(bundle, f)
-        return json_path
+        return json_path, side_paths
 
     # ----- Internals --------------------------------------------------------
 
@@ -272,10 +336,14 @@ class MinicpmvSession:
         )
 
         weights_path = os.path.join(self.model_path, "model.safetensors")
-        print(f"[minicpmv_session] spawning engine server (weights load ~30s)…",
+        cmd = [self.engine_bin, "--server", "--weights", weights_path]
+        if self.with_vision:
+            cmd.append("--with-vision")
+        load_hint = "~60s" if self.with_vision else "~30s"
+        print(f"[minicpmv_session] spawning engine server (weights load {load_hint})…",
               file=sys.stderr, flush=True)
         proc = subprocess.Popen(
-            [self.engine_bin, "--server", "--weights", weights_path],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
