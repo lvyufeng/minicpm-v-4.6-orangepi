@@ -1040,10 +1040,16 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     Tensor conv_input({4, ConvDim}, DType::Float16); conv_input.allocate();
     copy_matrix_rows(cache.conv_buf, 0, conv_input, 0, 3, stream);
     copy_matrix_rows(qkv, 0, conv_input, 3, 1, stream);
-    Tensor conv_all({4, ConvDim}, DType::Float16); conv_all.allocate();
-    linear_causal_conv(conv_input, *weights.conv1d_weight, conv_all, stream);
     Tensor conv_last({1, ConvDim}, DType::Float16); conv_last.allocate();
-    copy_matrix_rows(conv_all, 3, conv_last, 0, 1, stream);
+    if (weights.conv1d_step_weight != nullptr) {
+        // Fast path: vectorized kernel computes only the last row directly,
+        // skipping the [4, C] generic-conv work whose first 3 rows are unused.
+        linear_causal_conv_step(conv_input, *weights.conv1d_step_weight, conv_last, stream);
+    } else {
+        Tensor conv_all({4, ConvDim}, DType::Float16); conv_all.allocate();
+        linear_causal_conv(conv_input, *weights.conv1d_weight, conv_all, stream);
+        copy_matrix_rows(conv_all, 3, conv_last, 0, 1, stream);
+    }
     copy_matrix_rows(conv_input, 1, cache.conv_buf, 0, 3, stream);
 
     Tensor mixed({1, ConvDim}, DType::Float16); mixed.allocate();

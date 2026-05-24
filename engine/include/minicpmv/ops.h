@@ -82,6 +82,16 @@ void linear_causal_conv(const Tensor& x,
                         Tensor& out,
                         aclrtStream stream);
 
+// Single-step variant of linear_causal_conv for K=4 decode. Input x: [4, C] fp16
+// (3 cached history rows + 1 new row). weight_t: [4, C] fp16, transposed from
+// the canonical [C, 4] layout so each tap's weights are contiguous. Output:
+// [1, C] fp16 corresponding to the last row of the full conv. Vectorized with
+// UB DMA + fp16 vector mul/add — ~5-10x faster than the generic kernel at T=1.
+void linear_causal_conv_step(const Tensor& x,
+                             const Tensor& weight_t,
+                             Tensor& out,
+                             aclrtStream stream);
+
 // Linear-attention recurrent gated delta rule on NPU.
 // mixed:  [T, 6144] fp16 (post conv1d+SiLU), layout q|k|v contiguous over heads.
 // beta:   [T, 16]   fp16 (precomputed sigmoid(b))

@@ -1,0 +1,11 @@
+{
+  "op": "LinearCausalConvStepCustom",
+  "input_desc": [
+    {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "weight_t", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

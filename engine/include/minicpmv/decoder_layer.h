@@ -97,6 +97,10 @@ struct LinearAttentionDecoderLayerWeights {
     const Tensor* gate_proj_weight;
     const Tensor* up_proj_weight;
     const Tensor* down_proj_weight;
+    // Optional pre-transposed [4, C] conv weight for the T=1 decode step. When
+    // set, the step path uses the vectorized linear_causal_conv_step kernel
+    // instead of the generic causal conv + last-row extract.
+    const Tensor* conv1d_step_weight{nullptr};
 };
 
 void linear_attention_decoder_layer(const Tensor& hidden,

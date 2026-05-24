@@ -43,6 +43,9 @@ struct LanguageModelLayerWeights {
     Tensor a_log;
     Tensor gated_norm_w;
     Tensor out_proj_w;
+    // Pre-transposed [4, C=6144] view of conv_w for the T=1 decode step kernel.
+    // Each of the 4 rows holds one tap's weights across all channels.
+    Tensor conv_w_step_t;
     // full
     Tensor q_w;
     Tensor k_w;

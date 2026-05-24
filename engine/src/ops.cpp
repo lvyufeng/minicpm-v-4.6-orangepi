@@ -19,6 +19,7 @@
 #include <aclnnop/aclnn_sub.h>
 #include "aclnn_rms_norm1024_custom.h"
 #include "aclnn_linear_causal_conv_custom.h"
+#include "aclnn_linear_causal_conv_step_custom.h"
 #include "aclnn_linear_gated_delta_rule_custom.h"
 #include "aclnn_linear_gated_delta_rule_step_custom.h"
 #include "aclnn_gated_rms_norm_z_custom.h"
@@ -913,6 +914,39 @@ void linear_causal_conv(const Tensor& x,
         throw std::runtime_error("aclnnLinearCausalConvCustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
     run_op("aclnnLinearCausalConvCustom", ws_size, executor, stream, aclnnLinearCausalConvCustom);
+}
+
+void linear_causal_conv_step(const Tensor& x,
+                             const Tensor& weight_t,
+                             Tensor& out,
+                             aclrtStream stream) {
+    if (x.dtype() != DType::Float16 || weight_t.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("linear_causal_conv_step requires fp16 tensors");
+    }
+    if (x.shape().size() != 2 || x.shape()[0] != 4) {
+        throw std::runtime_error("linear_causal_conv_step x must be [4, C]");
+    }
+    const int64_t C = x.shape()[1];
+    if (weight_t.shape() != std::vector<int64_t>{4, C}) {
+        throw std::runtime_error("linear_causal_conv_step weight_t must be [4, C]");
+    }
+    if (out.shape() != std::vector<int64_t>{1, C}) {
+        throw std::runtime_error("linear_causal_conv_step out must be [1, C]");
+    }
+
+    AclTensorHandle hx, hw, ho;
+    make_acl_tensor(x, hx);
+    make_acl_tensor(weight_t, hw);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnLinearCausalConvStepCustomGetWorkspaceSize(hx.tensor, hw.tensor, ho.tensor,
+                                                                &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnLinearCausalConvStepCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnLinearCausalConvStepCustom", ws_size, executor, stream, aclnnLinearCausalConvStepCustom);
 }
 
 void linear_gated_delta_rule(const Tensor& mixed,

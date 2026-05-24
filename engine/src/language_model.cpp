@@ -79,6 +79,31 @@ Tensor load_matmul_weight_transposed(WeightsIndex& index, int layer, const std::
     return dst;
 }
 
+// Transpose a causal-conv weight from canonical [C, K=4] (or [C, 1, K]) layout
+// into [K=4, C], so each of the 4 rows holds one tap's weights across all
+// channels — what `linear_causal_conv_step` expects.
+Tensor build_conv_step_weight(const Tensor& conv_w) {
+    const auto& s = conv_w.shape();
+    int64_t C = 0;
+    int64_t K = 0;
+    if (s.size() == 2) { C = s[0]; K = s[1]; }
+    else if (s.size() == 3 && s[1] == 1) { C = s[0]; K = s[2]; }
+    else { throw std::runtime_error("conv weight must be [C, 4] or [C, 1, 4]"); }
+    if (K != 4) throw std::runtime_error("conv step weight expects K=4");
+
+    std::vector<uint16_t> host_CK(C * K);
+    conv_w.copy_to_host(host_CK.data(), host_CK.size() * sizeof(uint16_t));
+    std::vector<uint16_t> host_KC(K * C);
+    for (int64_t c = 0; c < C; ++c) {
+        for (int64_t k = 0; k < K; ++k) {
+            host_KC[k * C + c] = host_CK[c * K + k];
+        }
+    }
+    Tensor dst({K, C}, DType::Float16);
+    dst.copy_from_host(host_KC.data(), host_KC.size() * sizeof(uint16_t));
+    return dst;
+}
+
 }  // namespace
 
 LanguageModelConfig default_minicpmv46_lm_config() {
@@ -117,6 +142,7 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
             lw.a_log = load_layer_weight(index, static_cast<int>(layer), "linear_attn.A_log");
             lw.gated_norm_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.norm.weight");
             lw.out_proj_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.out_proj.weight");
+            lw.conv_w_step_t = build_conv_step_weight(lw.conv_w);
         } else {
             lw.q_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.q_proj.weight");
             lw.k_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.k_proj.weight");
@@ -205,6 +231,7 @@ void run_layer_step(int64_t layer,
             &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
             &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
             &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+            &lw.conv_w_step_t,
         };
         linear_attention_decoder_layer_step(hidden, ww, lcfg, state.linear[linear_i], next, stream);
         ++linear_i;
