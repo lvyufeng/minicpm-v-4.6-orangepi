@@ -3,7 +3,7 @@
 
 Streams generated tokens to stdout. Wraps the reusable
 `minicpmv.session.MinicpmvSession`; see that module for the Python API.
-Text-only — no torch_npu dependency. Image support TBD."""
+Text + single-slice image — no torch_npu dependency."""
 
 from __future__ import annotations
 
@@ -21,21 +21,27 @@ from minicpmv.session import MinicpmvSession  # noqa: E402
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--prompt", required=True, help="User text prompt")
+    p.add_argument("--image", default=None,
+                   help="Optional image file path. Loads the vision tower (~1.5 GB extra NPU).")
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--engine-bin", default=None,
                    help="Override engine binary path (default: $REPO/build/minicpmv_hybrid_decode)")
     return p.parse_args()
 
 
-def build_user_message(prompt: str) -> list[dict]:
-    return [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+def build_user_message(prompt: str, image: str | None) -> list[dict]:
+    parts: list[dict] = []
+    if image:
+        parts.append({"type": "image", "url": image})
+    parts.append({"type": "text", "text": prompt})
+    return [{"role": "user", "content": parts}]
 
 
 def main() -> int:
     args = parse_args()
-    session = MinicpmvSession(engine_bin=args.engine_bin)
+    session = MinicpmvSession(engine_bin=args.engine_bin, with_vision=bool(args.image))
 
-    messages = build_user_message(args.prompt)
+    messages = build_user_message(args.prompt, args.image)
     last_stats: dict = {}
     for _tok, text, stats in session.generate(messages, max_new_tokens=args.max_new_tokens):
         last_stats = stats

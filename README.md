@@ -1,8 +1,10 @@
 # MiniCPM-V 4.6 on Ascend 310B (Orange Pi AIPro 20T)
 
-A from-scratch C++/AscendC inference engine for the [MiniCPM-V 4.6][minicpmv]
-language model, targeting the Ascend 310B NPU on Orange Pi AIPro 20T boards
-where stock toolchains underutilize the hardware.
+A from-scratch C++/AscendC inference engine for [MiniCPM-V 4.6][minicpmv]
+on the Ascend 310B NPU in the Orange Pi AIPro 20T board. **Text and image
+chat both run entirely on the NPU through one engine subprocess — Python
+only does CPU-side tokenization and image-preprocessing, with no
+`torch_npu` dependency on the hot path.**
 
 Three rounds of cube-unit / custom-kernel work took single-batch decode from
 **2.88 → 5.90 tokens/s** (~2×) on the full 24-layer hybrid linear/full
@@ -19,9 +21,15 @@ Measured at prompt_T=8, decode 30 tokens. The remaining ~170 ms / step is
 dominated by matmul weight-bandwidth cost; the next lever is weight
 quantization (see [Roadmap](#roadmap)).
 
-> ⚠ Single-batch decode only. The engine currently does greedy sampling and
-> targets a specific layer schedule (24 layers, 3:1 linear:full attention).
-> Different MiniCPM-V variants need config edits in `language_model.cpp`.
+The vision tower (SigLIP-so400m → vit_merger → projection to LM hidden,
+27 transformer layers total) is also ported to C++ / aclnn and validated
+end-to-end against the HF CPU reference: final LM-facing `image_features`
+match to within `max_abs_diff = 0.0098` for a 448×448 input.
+
+> ⚠ Single-batch greedy decode only. Vision currently runs **one** 448×448
+> slice per image (HF MiniCPM-V's high-res multi-slice pipeline is on the
+> [Roadmap](#roadmap)). Different MiniCPM-V variants need config edits in
+> `language_model.cpp` and `vision.cpp`.
 
 ## Hardware & software prerequisites
 
@@ -92,45 +100,63 @@ process CWD). Override with `MINICPMV_MODEL_PATH=/elsewhere/MiniCPM-V-4.6`.
 
 ## Run
 
+The primary surface is the [Gradio Web UI](#web-ui-gradio) below. CLI helpers
+and benchmarks are documented under [Diagnostics](#diagnostics).
+
+### Web UI (Gradio)
+
+Streaming multimodal chat over the C++ engine — text + image (single-slice
+448×448), no torch_npu required:
+
 ```bash
-# Source the env script once per shell. Exports ASCEND_CUSTOM_OPP_PATH so the
-# custom kernels are discovered by ACL.
+# One-time: install Gradio in your Python env (alongside the existing
+# transformers / pillow you already have for the processor).
+pip install gradio pillow
+
+source scripts/set_env.sh
+python3 src/python/gradio_app.py            # text + vision (default)
+# or:
+python3 src/python/gradio_app.py --text-only  # skip the ~1.5 GB vision-tower
+                                              # load if you only need text chat
+```
+
+Open <http://localhost:7860>. Drop an image into the message box alongside
+your prompt and the C++ engine runs the entire SigLIP vision tower on the
+NPU before prefill. Each response streams token-by-token; the footer reports
+time-to-first-token and decode tokens/s.
+
+Startup time:
+
+| Mode | First-ready cost (one-shot) |
+|---|---|
+| `--text-only` | ~50 s (LM weights → NPU) + ~2 s warmup |
+| default (with vision) | ~75 s (LM + SigLIP → NPU) + ~2 s warmup |
+
+After that, **any new prompt shape is GPU-like** — no per-shape JIT cliff
+(see [Engine architecture notes](#engine-architecture)).
+
+> ⚠ **Vision is single-slice for now.** The HF MiniCPM-V processor can split
+> high-res images into up to 9 sub-images for finer detail. The engine
+> currently runs the SigLIP tower over **one** 448×448 slice (32×32 patch
+> grid → 64 image tokens), and the Python side passes `max_slice_nums=1` to
+> the processor so token counts line up. High-res detail recognition is
+> reduced; multi-slice scatter is on the roadmap.
+
+### CLI
+
+```bash
 source scripts/set_env.sh
 
 # Decode benchmark — primary tps number.
 ./build/bench_decode 8 30
 # → prompt_T=8  prefill_ms=...  per_step_ms=...  tokens/s=...
 
-# End-to-end greedy generation, text-only:
+# Greedy generation from a text prompt.
 python3 src/python/run_hybrid.py --prompt "你好,介绍一下你自己"
-
-# End-to-end with an image (multimodal):
-python3 src/python/run_hybrid.py \
-    --prompt "What's in this image?" --image path/to/img.png
 
 # Compare engine logits against a PyTorch reference (regression sanity):
 python3 src/python/compare_logits.py
 ```
-
-### Web UI (Gradio)
-
-A streaming chat + vision UI is available for interactive testing:
-
-```bash
-# One-time: install Gradio in your Python env.
-pip install gradio pillow
-
-# Launch (loads the HF model + processor once at startup, ~60s on cold start).
-source scripts/set_env.sh
-python3 src/python/gradio_app.py
-
-# Then open http://localhost:7860 in a browser. Pass --share to publish a
-# temporary public URL via gradio's tunnel.
-```
-
-The UI is multimodal: drop an image into the message box alongside your text
-to ask vision questions. Each response streams token-by-token and shows
-time-to-first-token and decode tokens/s at the bottom of the reply.
 
 For unit tests and the full bench suite, see [Diagnostics](#diagnostics).
 
@@ -191,6 +217,47 @@ manual-weight tests keep using the generic kernel for correctness.
 - `attention_step` — single-token full-attention (softmax(q·K)·V) per head
 - `linear_gated_delta_rule` (+ `_step`) — gated-delta-rule recurrence
 
+### 4. SigLIP vision tower in C++ (no torch_npu)
+
+The whole vision path runs on the NPU through the same engine subprocess as
+the LM. Python only does CPU-side tokenization and image-preprocessing via
+HF's `AutoProcessor` — no `torch_npu` import, no HF model load.
+
+Pipeline implemented in `src/csrc/lib/vision.cpp`:
+
+```
+pixel_values [1, 3, 14, P·14]  (HF naflex patch-strip layout)
+   ↓  vision_patch_embed       (aclnnConvolution)
+   ↓  vision_position_embed    (4900-entry table indexed via host bucketize)
+   ↓  encoder_layer × 7        (SigLIP: pre-LN attn + GELU(tanh) MLP)
+   ↓  vit_merger               (2×2 window attn + 4-patch concat MLP)
+   ↓  encoder_layer × 20
+   ↓  layer_norm (post)
+   ↓  merger_mlp               (2×2 spatial concat + pre-LN + linear + GELU + linear)
+   ↓  image_features [1, P/16, 1024]  ← LM-facing tokens
+```
+
+For a 448×448 image (32×32 patch grid) this is 1024 → 256 → 64 image
+tokens. Validated against a CPU torch reference end-to-end:
+
+| Stage | max abs diff vs HF |
+|---|---:|
+| patch_embed | 0.0001 |
+| 7-layer encoder stack | 0.0273 |
+| vit_merger | 0.0498 |
+| post_layernorm | 0.0469 |
+| **image_features** | **0.0098** |
+
+Two ACL gotchas surfaced and fixed during the port:
+
+- CANN's precompiled `MatMulV2_FP16` binary returns `kernel pointer null`
+  (errno 361001) for shapes with `M >= 64 && K > 4096`. `matmul_b_transposed`
+  now K-tiles to 4096 chunks and accumulates partials for those shapes.
+- Plain `aclnnAdd` with input and output aliased to the same buffer leaves
+  the MatMulV2 kernel cache in a bad state, breaking subsequent `aclnnMm`
+  calls. `linear_bias` uses `aclnnInplaceAdd` (the dedicated in-place API)
+  for the bias add.
+
 ## Diagnostics
 
 End-to-end:
@@ -224,6 +291,8 @@ Correctness:
 | `./build/test_autoregressive_decode` | multi-step decode regression |
 | `./build/test_incremental_decode` | single-step decode regression |
 | `./build/test_full_language_model` | 24-layer forward smoke |
+| `./build/test_vision_ops` | conv2d / gelu / batch_matmul standalone |
+| `./build/test_vision_patch_embed` | full vision tower vs HF (needs `/tmp/dump_vision_ref.py` ref dump) |
 
 ## Performance breakdown
 
@@ -246,6 +315,11 @@ can close.
 
 ## Roadmap
 
+- **Multi-slice vision** so high-res images keep their detail. The HF
+  MiniCPM-V processor splits images into up to 9 sub-images at full
+  resolution; the engine currently runs the SigLIP tower on a single 448×448
+  slice (~64 image tokens). Need to loop the tower N times and stitch
+  features into the prompt per slice.
 - **Weight quantization** is the only remaining lever for serious tps gains.
   int8 halves the bytes read for every matmul → estimated ~10 tps. int4 →
   estimated ~14 tps. Will need dequant-fused matmul kernels on the cube path.
