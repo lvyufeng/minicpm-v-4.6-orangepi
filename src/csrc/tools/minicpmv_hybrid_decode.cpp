@@ -108,8 +108,9 @@ struct Bundle {
     std::vector<std::string> layer_types;
     std::string embeddings_dtype;
     std::string embeddings_endianness;
-    std::string embeddings_path;
+    std::string embeddings_path;  // optional: empty = use engine-side embedding lookup on input_ids
     std::string weights_path;
+    std::vector<int64_t> input_ids;  // required for text-only path; used as fallback for image path
 };
 
 Bundle read_bundle(const std::string& json_path) {
@@ -142,34 +143,50 @@ Bundle read_bundle(const std::string& json_path) {
     b.embeddings_path = parse_string(s, pos);
     if (!parse_key(s, "weights_path", pos)) throw std::runtime_error("bundle missing weights_path");
     b.weights_path = parse_string(s, pos);
+    if (parse_key(s, "input_ids", pos)) {
+        b.input_ids = parse_int_list(s, pos);
+    }
     return b;
 }
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    std::string bundle_path;
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
+// Process one bundle: read the bundle JSON + its embeddings file, run prefill
+// from the embeddings, greedy-decode up to b.max_new_tokens or EOS, and stream
+// each token id on its own line to stdout. Emits `# done reason=... steps=N`
+// when finished. Throws on bundle/IO/shape errors.
+static void process_bundle(const std::string& bundle_path,
+                           const LanguageModelWeights& w,
+                           const LanguageModelConfig& cfg,
+                           const Tensor& cos_t,
+                           const Tensor& sin_t,
+                           aclrtStream stream) {
+    Bundle b = read_bundle(bundle_path);
+    if (b.hidden_size != cfg.hidden_size) throw std::runtime_error("hidden_size mismatch");
+    if (b.vocab_size != cfg.vocab_size) throw std::runtime_error("vocab_size mismatch");
+    if (!b.layer_types.empty() && b.layer_types != cfg.layer_types) {
+        throw std::runtime_error("layer_types mismatch with server-loaded weights");
     }
-    if (bundle_path.empty()) {
-        std::cerr << "usage: minicpmv_hybrid_decode --bundle <prefix>.json" << std::endl;
-        return 2;
+    if (b.max_seq_len > cos_t.shape()[0]) {
+        throw std::runtime_error("bundle max_seq_len exceeds pre-built rope table size");
     }
-    try {
-        Bundle b = read_bundle(bundle_path);
+
+    Tensor prompt_hidden({b.seq_len, cfg.hidden_size}, DType::Float16);
+    if (b.embeddings_path.empty()) {
+        // Text-only path: skip the Python torch_npu embedding lookup (which
+        // pays a 30-50s JIT compile per unique seq_len), do it here on the
+        // engine side using the already-loaded w.embed.
+        if (static_cast<int64_t>(b.input_ids.size()) != b.seq_len) {
+            throw std::runtime_error("bundle input_ids count != seq_len in text-only mode");
+        }
+        std::vector<int32_t> ids;
+        ids.reserve(b.input_ids.size());
+        for (auto v : b.input_ids) ids.push_back(static_cast<int32_t>(v));
+        prompt_hidden.allocate();
+        embedding_lookup(w.embed, ids, prompt_hidden, stream);
+    } else {
         if (b.embeddings_dtype != "float16") throw std::runtime_error("only float16 embeddings supported");
         if (b.embeddings_endianness != "little") throw std::runtime_error("only little-endian supported");
-
-        AclContext ctx(0);
-        WeightsIndex index(b.weights_path);
-        LanguageModelConfig cfg = default_minicpmv46_lm_config();
-        if (b.hidden_size != cfg.hidden_size) throw std::runtime_error("hidden_size mismatch");
-        if (b.vocab_size != cfg.vocab_size) throw std::runtime_error("vocab_size mismatch");
-        if (!b.layer_types.empty()) cfg.layer_types = b.layer_types;
-        LanguageModelWeights w = load_language_model_weights(index, cfg);
-
         std::vector<uint16_t> embeds_host(static_cast<size_t>(b.seq_len * cfg.hidden_size));
         {
             std::ifstream ef(b.embeddings_path, std::ios::binary);
@@ -178,46 +195,98 @@ int main(int argc, char** argv) {
                     static_cast<std::streamsize>(embeds_host.size() * sizeof(uint16_t)));
             if (!ef) throw std::runtime_error("short read on embeddings file");
         }
-        Tensor prompt_hidden({b.seq_len, cfg.hidden_size}, DType::Float16);
         prompt_hidden.copy_from_host(embeds_host.data(), embeds_host.size() * sizeof(uint16_t));
+    }
 
-        Tensor cos_t, sin_t;
-        build_rope_tables(b.max_seq_len, cfg, cos_t, sin_t);
+    DecodeState state = make_decode_state(b.max_seq_len,
+                                          cfg.layer_types,
+                                          FullAttentionDecoderLayerConfig{cfg.num_q_heads, cfg.num_kv_heads,
+                                                                          cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon},
+                                          stream);
 
-        DecodeState state = make_decode_state(b.max_seq_len,
-                                              cfg.layer_types,
-                                              FullAttentionDecoderLayerConfig{cfg.num_q_heads, cfg.num_kv_heads,
-                                                                              cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon},
-                                              ctx.stream());
+    Tensor last_hidden = prefill_from_embeddings(prompt_hidden, w, cfg, cos_t, sin_t, state, stream);
+    int64_t next_tok = lm_head_greedy(last_hidden, w, cfg, stream);
+    std::cout << next_tok << std::endl;
+    std::cout.flush();
 
-        Tensor last_hidden = prefill_from_embeddings(prompt_hidden, w, cfg, cos_t, sin_t, state, ctx.stream());
-        int64_t next_tok = lm_head_greedy(last_hidden, w, cfg, ctx.stream());
-        std::cout << next_tok << std::endl;
-        std::cout.flush();
+    const char* reason = "max";
+    int64_t emitted = 1;
+    if (is_eos(next_tok, b.eos_token_ids)) {
+        reason = "eos";
+    } else {
+        for (int64_t step = 1; step < b.max_new_tokens; ++step) {
+            if (state.seq_len >= state.max_seq_len) { reason = "max_seq_len"; break; }
+            next_tok = decode_step_greedy(static_cast<int32_t>(next_tok), w, cfg,
+                                          cos_t, sin_t, state, stream);
+            std::cout << next_tok << std::endl;
+            std::cout.flush();
+            ++emitted;
+            if (is_eos(next_tok, b.eos_token_ids)) { reason = "eos"; break; }
+        }
+    }
+    std::cout << "# done reason=" << reason << " steps=" << emitted << std::endl;
+    std::cout.flush();
+}
 
-        const char* reason = "max";
-        int64_t emitted = 1;
-        if (is_eos(next_tok, b.eos_token_ids)) {
-            reason = "eos";
+int main(int argc, char** argv) {
+    bool server_mode = false;
+    std::string bundle_path;
+    std::string weights_path_arg;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--server") server_mode = true;
+        else if (a == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
+        else if (a == "--weights" && i + 1 < argc) weights_path_arg = argv[++i];
+    }
+    if (!server_mode && bundle_path.empty()) {
+        std::cerr << "usage:\n"
+                  << "  minicpmv_hybrid_decode --bundle <prefix>.json     (single-shot)\n"
+                  << "  minicpmv_hybrid_decode --server --weights <path>  (server mode: one bundle path per stdin line)\n"
+                  << std::endl;
+        return 2;
+    }
+    try {
+        AclContext ctx(0);
+        LanguageModelConfig cfg = default_minicpmv46_lm_config();
+
+        std::string weights_path;
+        if (!weights_path_arg.empty()) {
+            weights_path = weights_path_arg;
         } else {
-            for (int64_t step = 1; step < b.max_new_tokens; ++step) {
-                if (state.seq_len >= state.max_seq_len) {
-                    reason = "max_seq_len";
-                    break;
-                }
-                next_tok = decode_step_greedy(static_cast<int32_t>(next_tok), w, cfg,
-                                              cos_t, sin_t, state, ctx.stream());
-                std::cout << next_tok << std::endl;
-                std::cout.flush();
-                ++emitted;
-                if (is_eos(next_tok, b.eos_token_ids)) {
-                    reason = "eos";
-                    break;
-                }
-            }
+            // Single-shot mode: take weights_path + layer_types from the bundle so
+            // existing callers don't need to pass them explicitly.
+            Bundle b = read_bundle(bundle_path);
+            weights_path = b.weights_path;
+            if (!b.layer_types.empty()) cfg.layer_types = b.layer_types;
         }
 
-        std::cout << "# done reason=" << reason << " steps=" << emitted << std::endl;
+        std::cerr << "# loading weights..." << std::endl;
+        WeightsIndex index(weights_path);
+        LanguageModelWeights w = load_language_model_weights(index, cfg);
+
+        // Build rope tables once for a generous max sequence — request bundles
+        // are checked against this in process_bundle().
+        constexpr int64_t kMaxRopeSeq = 8192;
+        Tensor cos_t, sin_t;
+        build_rope_tables(kMaxRopeSeq, cfg, cos_t, sin_t);
+
+        if (server_mode) {
+            std::cerr << "# server_ready" << std::endl;
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                if (line.empty()) continue;
+                if (line == "quit" || line == "exit") break;
+                try {
+                    process_bundle(line, w, cfg, cos_t, sin_t, ctx.stream());
+                } catch (const std::exception& e) {
+                    std::cout << "# error: " << e.what() << std::endl;
+                    std::cout.flush();
+                }
+            }
+        } else {
+            process_bundle(bundle_path, w, cfg, cos_t, sin_t, ctx.stream());
+        }
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "minicpmv_hybrid_decode error: " << e.what() << std::endl;
