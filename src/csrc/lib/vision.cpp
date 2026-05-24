@@ -505,4 +505,69 @@ void vision_vit_merger(const Tensor& hidden,
     add(lin2_3d, residual_mean_3d, out, stream);
 }
 
+// Outer 2x2 spatial merger + projection to LM hidden size.
+// Replicates `MiniCPMV4_6Merger.forward` with `merge_kernel_size=(2,2)` and
+// the single-round (`merger_times=1`) MiniCPM-V 4.6 default. No residual on
+// this path (unlike vit_merger above), and the GELU uses the exact erf
+// formulation (PyTorch `nn.GELU()` with default approximate="none").
+void vision_merger_mlp(const Tensor& hidden,
+                       int64_t target_h,
+                       int64_t target_w,
+                       int64_t merge_h,
+                       int64_t merge_w,
+                       const DownsampleMlpWeights& w,
+                       double layer_norm_eps,
+                       Tensor& out,
+                       aclrtStream stream) {
+    if (hidden.shape().size() != 3 || hidden.shape()[0] != 1) {
+        throw std::runtime_error("merger_mlp expects [1, P, H]");
+    }
+    const int64_t P = hidden.shape()[1];
+    const int64_t H = hidden.shape()[2];
+    if (P != target_h * target_w) throw std::runtime_error("merger_mlp P mismatch target_sizes");
+    if (target_h % merge_h != 0 || target_w % merge_w != 0) {
+        throw std::runtime_error("merger_mlp target sizes must be divisible by merge kernel");
+    }
+    const int64_t mh = target_h / merge_h;
+    const int64_t mw = target_w / merge_w;
+    const int64_t num_groups = mh * mw;
+    const int64_t merged_hidden = H * merge_h * merge_w;   // 4608 for H=1152, 2x2
+
+    // Reshape [P, H] -> [mh, merge_h, mw, merge_w, H] -> permute(0,2,1,3,4)
+    Tensor hidden_2d({P, H}, DType::Float16); hidden_2d.allocate();
+    aclrtMemcpyAsync(hidden_2d.data(), hidden_2d.size_bytes(),
+                     hidden.data(), hidden.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor view5d({mh, merge_h, mw, merge_w, H}, DType::Float16); view5d.allocate();
+    aclrtMemcpyAsync(view5d.data(), view5d.size_bytes(),
+                     hidden_2d.data(), hidden_2d.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    Tensor view5d_perm({mh, mw, merge_h, merge_w, H}, DType::Float16); view5d_perm.allocate();
+    permute(view5d, {0, 2, 1, 3, 4}, view5d_perm, stream);
+
+    Tensor merged_flat({num_groups, merged_hidden}, DType::Float16); merged_flat.allocate();
+    aclrtMemcpyAsync(merged_flat.data(), merged_flat.size_bytes(),
+                     view5d_perm.data(), view5d_perm.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+
+    Tensor pre({num_groups, merged_hidden}, DType::Float16); pre.allocate();
+    layer_norm(merged_flat, w.pre_norm_w, w.pre_norm_b, pre, layer_norm_eps, stream);
+
+    const int64_t intermediate = w.linear_1_w.shape()[0];
+    Tensor lin1_out({num_groups, intermediate}, DType::Float16); lin1_out.allocate();
+    linear_bias(pre, w.linear_1_w, &w.linear_1_b, lin1_out, stream);
+
+    Tensor act({num_groups, intermediate}, DType::Float16); act.allocate();
+    gelu(lin1_out, /*tanh_approx=*/false, act, stream);
+
+    const int64_t llm_hidden = w.linear_2_w.shape()[0];
+    Tensor lin2_out({num_groups, llm_hidden}, DType::Float16); lin2_out.allocate();
+    linear_bias(act, w.linear_2_w, &w.linear_2_b, lin2_out, stream);
+
+    // Reshape result to [1, num_groups, llm_hidden] for output.
+    aclrtMemcpyAsync(out.data(), out.size_bytes(),
+                     lin2_out.data(), lin2_out.size_bytes(),
+                     ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+}
+
 }  // namespace minicpmv

@@ -141,4 +141,18 @@ void vision_vit_merger(const Tensor& hidden,
                        Tensor& out,
                        aclrtStream stream);
 
+// Outer merger MLP: spatial 2x2 reshape (P -> P/4 tokens, hidden -> 4*hidden)
+// then pre_norm + linear_1 + GELU (exact, not tanh approx) + linear_2 to LLM dim.
+//   hidden:    [1, P, H] fp16    (P = target_h * target_w, post-vit_merger grid)
+//   out:       [1, P/(mh*mw), llm_hidden] fp16  (1024 for MiniCPM-V LM)
+void vision_merger_mlp(const Tensor& hidden,
+                       int64_t target_h,
+                       int64_t target_w,
+                       int64_t merge_h,
+                       int64_t merge_w,
+                       const DownsampleMlpWeights& w,
+                       double layer_norm_eps,
+                       Tensor& out,
+                       aclrtStream stream);
+
 }  // namespace minicpmv
