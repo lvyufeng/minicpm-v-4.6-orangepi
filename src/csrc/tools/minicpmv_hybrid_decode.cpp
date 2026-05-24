@@ -3,6 +3,7 @@
 #include "minicpmv/language_model.h"
 #include "minicpmv/ops.h"
 #include "minicpmv/tensor.h"
+#include "minicpmv/vision.h"
 #include "minicpmv/weights.h"
 
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -111,6 +113,14 @@ struct Bundle {
     std::string embeddings_path;  // optional: empty = use engine-side embedding lookup on input_ids
     std::string weights_path;
     std::vector<int64_t> input_ids;  // required for text-only path; used as fallback for image path
+    // Optional vision inputs. When image_pixels_path is non-empty the engine
+    // runs the SigLIP vision tower + merger and scatters the resulting image
+    // features into prompt_hidden at every input_ids position equal to
+    // image_token_id.
+    std::string image_pixels_path;
+    int64_t image_target_h{0};
+    int64_t image_target_w{0};
+    int64_t image_token_id{248056};
 };
 
 Bundle read_bundle(const std::string& json_path) {
@@ -146,6 +156,18 @@ Bundle read_bundle(const std::string& json_path) {
     if (parse_key(s, "input_ids", pos)) {
         b.input_ids = parse_int_list(s, pos);
     }
+    if (parse_key(s, "image_pixels_path", pos)) {
+        b.image_pixels_path = parse_string(s, pos);
+    }
+    if (parse_key(s, "image_target_h", pos)) {
+        b.image_target_h = parse_int(s, pos);
+    }
+    if (parse_key(s, "image_target_w", pos)) {
+        b.image_target_w = parse_int(s, pos);
+    }
+    if (parse_key(s, "image_token_id", pos)) {
+        b.image_token_id = parse_int(s, pos);
+    }
     return b;
 }
 
@@ -158,6 +180,8 @@ Bundle read_bundle(const std::string& json_path) {
 static void process_bundle(const std::string& bundle_path,
                            const LanguageModelWeights& w,
                            const LanguageModelConfig& cfg,
+                           const VisionWeights* vw,
+                           const VisionConfig& vcfg,
                            const Tensor& cos_t,
                            const Tensor& sin_t,
                            aclrtStream stream) {
@@ -198,6 +222,114 @@ static void process_bundle(const std::string& bundle_path,
         prompt_hidden.copy_from_host(embeds_host.data(), embeds_host.size() * sizeof(uint16_t));
     }
 
+    // ---- optional vision path: run the SigLIP tower and scatter the
+    // resulting image features into prompt_hidden at every input_ids[i] that
+    // equals b.image_token_id.
+    if (!b.image_pixels_path.empty()) {
+        if (vw == nullptr) throw std::runtime_error("bundle has image but engine started without vision weights");
+        if (b.image_target_h <= 0 || b.image_target_w <= 0) {
+            throw std::runtime_error("image_target_h and image_target_w must be > 0");
+        }
+        const int64_t patch = vcfg.patch_size;
+        const int64_t P = b.image_target_h * b.image_target_w;
+        // Pixel values come in HF's naflex patch-strip layout: [1, 3, patch, P*patch].
+        const int64_t img_h = patch;
+        const int64_t img_w = P * patch;
+        std::vector<uint16_t> pix_host(static_cast<size_t>(3 * img_h * img_w));
+        {
+            std::ifstream pf(b.image_pixels_path, std::ios::binary);
+            if (!pf) throw std::runtime_error("failed to open image pixels: " + b.image_pixels_path);
+            pf.read(reinterpret_cast<char*>(pix_host.data()),
+                    static_cast<std::streamsize>(pix_host.size() * sizeof(uint16_t)));
+            if (!pf) throw std::runtime_error("short read on image pixels file");
+        }
+        Tensor pixels({1, 3, img_h, img_w}, DType::Float16); pixels.allocate();
+        pixels.copy_from_host(pix_host.data(), pix_host.size() * sizeof(uint16_t));
+
+        // Patch embedding + positional embedding.
+        Tensor patch_out({1, P, vcfg.hidden_size}, DType::Float16); patch_out.allocate();
+        vision_patch_embed(pixels, vw->patch_embedding_w, vw->patch_embedding_b,
+                           patch, patch_out, stream);
+        Tensor pe({P, vcfg.hidden_size}, DType::Float16); pe.allocate();
+        vision_position_embed(vw->position_embedding,
+                              b.image_target_h, b.image_target_w,
+                              vcfg.image_size / patch,
+                              pe, stream);
+        Tensor pe_3d({1, P, vcfg.hidden_size}, DType::Float16); pe_3d.allocate();
+        aclrtMemcpyAsync(pe_3d.data(), pe_3d.size_bytes(), pe.data(), pe.size_bytes(),
+                         ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        Tensor full({1, P, vcfg.hidden_size}, DType::Float16); full.allocate();
+        add(patch_out, pe_3d, full, stream);
+
+        // Run layers 0..insert_layer_id, vit_merger, then remaining layers.
+        Tensor cur({1, P, vcfg.hidden_size}, DType::Float16); cur.allocate();
+        aclrtMemcpyAsync(cur.data(), cur.size_bytes(), full.data(), full.size_bytes(),
+                         ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        for (int li = 0; li <= vcfg.insert_layer_id; ++li) {
+            Tensor next({1, P, vcfg.hidden_size}, DType::Float16); next.allocate();
+            vision_encoder_layer(cur, vw->layers[li], vcfg.num_attention_heads,
+                                 vcfg.layer_norm_eps, next, stream);
+            aclrtMemcpyAsync(cur.data(), cur.size_bytes(), next.data(), next.size_bytes(),
+                             ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        }
+        const int64_t Pm = P / (vcfg.window_h * vcfg.window_w);
+        Tensor vm({1, Pm, vcfg.hidden_size}, DType::Float16); vm.allocate();
+        vision_vit_merger(cur, b.image_target_h, b.image_target_w,
+                          vcfg.window_h, vcfg.window_w,
+                          vcfg.num_attention_heads, vw->vit_merger, vcfg.layer_norm_eps,
+                          vm, stream);
+        Tensor cur2({1, Pm, vcfg.hidden_size}, DType::Float16); cur2.allocate();
+        aclrtMemcpyAsync(cur2.data(), cur2.size_bytes(), vm.data(), vm.size_bytes(),
+                         ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        for (int li = vcfg.insert_layer_id + 1; li < vcfg.num_hidden_layers; ++li) {
+            Tensor next({1, Pm, vcfg.hidden_size}, DType::Float16); next.allocate();
+            vision_encoder_layer(cur2, vw->layers[li], vcfg.num_attention_heads,
+                                 vcfg.layer_norm_eps, next, stream);
+            aclrtMemcpyAsync(cur2.data(), cur2.size_bytes(), next.data(), next.size_bytes(),
+                             ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        }
+        Tensor post({1, Pm, vcfg.hidden_size}, DType::Float16); post.allocate();
+        layer_norm(cur2, vw->post_layernorm_w, vw->post_layernorm_b,
+                   post, vcfg.layer_norm_eps, stream);
+        const int64_t Pf = Pm / (vcfg.merge_h * vcfg.merge_w);
+        Tensor image_features({1, Pf, vcfg.llm_hidden_size}, DType::Float16);
+        image_features.allocate();
+        vision_merger_mlp(post,
+                          b.image_target_h / vcfg.window_h,
+                          b.image_target_w / vcfg.window_w,
+                          vcfg.merge_h, vcfg.merge_w,
+                          vw->merger_mlp[0], vcfg.layer_norm_eps,
+                          image_features, stream);
+
+        // Scatter image_features into prompt_hidden at image_token_id positions.
+        // image_features is [1, Pf, llm_hidden]; copy each row to the
+        // corresponding row of prompt_hidden.
+        std::vector<int64_t> img_positions;
+        img_positions.reserve(Pf);
+        for (int64_t i = 0; i < b.seq_len; ++i) {
+            if (i < static_cast<int64_t>(b.input_ids.size()) &&
+                b.input_ids[i] == b.image_token_id) {
+                img_positions.push_back(i);
+            }
+        }
+        if (static_cast<int64_t>(img_positions.size()) != Pf) {
+            throw std::runtime_error("image_token positions in input_ids != Pf: got "
+                                     + std::to_string(img_positions.size())
+                                     + " expected " + std::to_string(Pf));
+        }
+        const size_t row_bytes = static_cast<size_t>(cfg.hidden_size) * sizeof(uint16_t);
+        for (int64_t k = 0; k < Pf; ++k) {
+            void* dst = static_cast<uint8_t*>(prompt_hidden.data()) +
+                        static_cast<size_t>(img_positions[k]) * row_bytes;
+            const void* src = static_cast<const uint8_t*>(image_features.data()) +
+                              static_cast<size_t>(k) * row_bytes;
+            check_acl(aclrtMemcpyAsync(dst, row_bytes, src, row_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                      "image scatter");
+        }
+        check_acl(aclrtSynchronizeStream(stream), "image scatter sync");
+    }
+
     DecodeState state = make_decode_state(b.max_seq_len,
                                           cfg.layer_types,
                                           FullAttentionDecoderLayerConfig{cfg.num_q_heads, cfg.num_kv_heads,
@@ -230,39 +362,48 @@ static void process_bundle(const std::string& bundle_path,
 
 int main(int argc, char** argv) {
     bool server_mode = false;
+    bool with_vision = false;
     std::string bundle_path;
     std::string weights_path_arg;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--server") server_mode = true;
+        else if (a == "--with-vision") with_vision = true;
         else if (a == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
         else if (a == "--weights" && i + 1 < argc) weights_path_arg = argv[++i];
     }
     if (!server_mode && bundle_path.empty()) {
         std::cerr << "usage:\n"
-                  << "  minicpmv_hybrid_decode --bundle <prefix>.json     (single-shot)\n"
-                  << "  minicpmv_hybrid_decode --server --weights <path>  (server mode: one bundle path per stdin line)\n"
+                  << "  minicpmv_hybrid_decode --bundle <prefix>.json [--with-vision]   (single-shot)\n"
+                  << "  minicpmv_hybrid_decode --server --weights <path> [--with-vision]\n"
                   << std::endl;
         return 2;
     }
     try {
         AclContext ctx(0);
         LanguageModelConfig cfg = default_minicpmv46_lm_config();
+        VisionConfig vcfg = default_minicpmv46_vision_config();
 
         std::string weights_path;
         if (!weights_path_arg.empty()) {
             weights_path = weights_path_arg;
         } else {
-            // Single-shot mode: take weights_path + layer_types from the bundle so
-            // existing callers don't need to pass them explicitly.
             Bundle b = read_bundle(bundle_path);
             weights_path = b.weights_path;
             if (!b.layer_types.empty()) cfg.layer_types = b.layer_types;
+            // Auto-enable vision if the bundle is image-bearing.
+            if (!b.image_pixels_path.empty()) with_vision = true;
         }
 
         std::cerr << "# loading weights..." << std::endl;
         WeightsIndex index(weights_path);
         LanguageModelWeights w = load_language_model_weights(index, cfg);
+
+        std::unique_ptr<VisionWeights> vw;
+        if (with_vision) {
+            std::cerr << "# loading vision weights..." << std::endl;
+            vw = std::make_unique<VisionWeights>(load_vision_weights(index, vcfg));
+        }
 
         // Build rope tables once for a generous max sequence — request bundles
         // are checked against this in process_bundle().
@@ -278,14 +419,14 @@ int main(int argc, char** argv) {
                 if (line.empty()) continue;
                 if (line == "quit" || line == "exit") break;
                 try {
-                    process_bundle(line, w, cfg, cos_t, sin_t, ctx.stream());
+                    process_bundle(line, w, cfg, vw.get(), vcfg, cos_t, sin_t, ctx.stream());
                 } catch (const std::exception& e) {
                     std::cout << "# error: " << e.what() << std::endl;
                     std::cout.flush();
                 }
             }
         } else {
-            process_bundle(bundle_path, w, cfg, cos_t, sin_t, ctx.stream());
+            process_bundle(bundle_path, w, cfg, vw.get(), vcfg, cos_t, sin_t, ctx.stream());
         }
         return 0;
     } catch (const std::exception& e) {
