@@ -348,6 +348,11 @@ Apache License 2.0. See [`LICENSE`](LICENSE).
 The MiniCPM-V model weights are released by [OpenBMB][openbmb] under their
 own license; please respect the upstream terms when redistributing.
 
+## Friendly links
+
+- [linux.do](https://linux.do/)
+
+
 ## Acknowledgements
 
 - [OpenBMB / MiniCPM-V team][minicpmv] for the model
