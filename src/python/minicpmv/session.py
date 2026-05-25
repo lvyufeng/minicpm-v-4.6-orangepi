@@ -115,6 +115,7 @@ class MinicpmvSession:
         self,
         messages: List[Dict],
         max_new_tokens: int = 128,
+        conversation_id: Optional[str] = None,
     ) -> Generator[Tuple[int, str, Dict], None, None]:
         """Stream the assistant turn for `messages`.
 
@@ -131,7 +132,7 @@ class MinicpmvSession:
             with token_count, elapsed_s, decode_s, tps for the current stream.
         """
         prepared = self._prepare_inputs(messages)
-        bundle_json, side_paths = self._write_bundle(prepared, max_new_tokens)
+        bundle_json, side_paths = self._write_bundle(prepared, max_new_tokens, conversation_id)
         try:
             yield from self._run_engine_streaming(bundle_json)
         finally:
@@ -220,6 +221,7 @@ class MinicpmvSession:
         self,
         prepared: Dict[str, Any],
         max_new_tokens: int,
+        conversation_id: Optional[str],
     ) -> Tuple[str, List[str]]:
         input_ids = prepared["input_ids"]
         seq_len = len(input_ids)
@@ -232,9 +234,14 @@ class MinicpmvSession:
 
         bundle = {
             "version": 1,
+            "conversation_id": conversation_id or "",
             "seq_len": seq_len,
             "hidden_size": HIDDEN_SIZE,
-            "max_seq_len": seq_len + max_new_tokens + 4,
+            # Reserve a large fixed budget per conversation so the engine
+            # doesn't drop and rebuild the prefix cache every time the
+            # request grows. We still bound this to the engine's pre-built
+            # rope-table size (8192).
+            "max_seq_len": min(8192, max(seq_len + max_new_tokens + 4, 2048)),
             "max_new_tokens": max_new_tokens,
             "vocab_size": VOCAB_SIZE,
             "eos_token_ids": EOS_TOKEN_IDS,
@@ -373,12 +380,13 @@ class MinicpmvSession:
             if "# server_ready" in line:
                 break
 
-        # Drain any remaining stderr in a background thread so it doesn't
-        # backpressure the engine.
+        # Forward post-startup engine stderr to ours so prefix-cache diagnostics
+        # and any engine warnings are visible to the caller.
         def _drain_stderr() -> None:
             try:
-                for _ in iter(proc.stderr.readline, ""):
-                    pass
+                for line in iter(proc.stderr.readline, ""):
+                    sys.stderr.write("[engine] " + line)
+                    sys.stderr.flush()
             except Exception:
                 pass
 

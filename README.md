@@ -28,10 +28,10 @@ The vision tower (SigLIP-so400m → vit_merger → projection to LM hidden,
 end-to-end against the HF CPU reference: final LM-facing `image_features`
 match to within `max_abs_diff = 0.0098` for a 448×448 input.
 
-> ⚠ Single-batch greedy decode only. Vision currently runs **one** 448×448
-> slice per image (HF MiniCPM-V's high-res multi-slice pipeline is on the
-> [Roadmap](#roadmap)). Different MiniCPM-V variants need config edits in
-> `language_model.cpp` and `vision.cpp`.
+> ⚠ Single-batch greedy decode only. Vision splits high-resolution images into
+> up to 9 ~448×448 slices and runs the SigLIP tower once per slice (see
+> [Vision slicing](#vision-slicing) below). Different MiniCPM-V variants need
+> config edits in `language_model.cpp` and `vision.cpp`.
 
 ## Quickstart
 
@@ -113,30 +113,30 @@ process CWD). Override with `MINICPMV_MODEL_PATH=/elsewhere/MiniCPM-V-4.6`.
 
 ## Run
 
+
 The primary surface is the [Gradio Web UI](#web-ui-gradio) below. CLI helpers
 and benchmarks are documented under [Diagnostics](#diagnostics).
 
 ### Web UI (Gradio)
 
-Streaming multimodal chat over the C++ engine — text + image (single-slice
-448×448), no torch_npu required:
+Streaming multimodal chat over the C++ engine — text + image, **multi-slice
+vision enabled**, no `torch_npu` required on the Python side:
 
 ```bash
-# One-time: install Gradio in your Python env (alongside the existing
-# transformers / pillow you already have for the processor).
+# One-time: install Gradio in your Python env (alongside transformers / pillow).
 pip install gradio pillow
 
 source scripts/set_env.sh
 python3 src/python/gradio_app.py            # text + vision (default)
 # or:
-python3 src/python/gradio_app.py --text-only  # skip the ~1.5 GB vision-tower
-                                              # load if you only need text chat
+python3 src/python/gradio_app.py --text-only  # skip the ~1.5 GB vision tower
+                                              # if you only need text chat
 ```
 
 Open <http://localhost:7860>. Drop an image into the message box alongside
-your prompt and the C++ engine runs the entire SigLIP vision tower on the
-NPU before prefill. Each response streams token-by-token; the footer reports
-time-to-first-token and decode tokens/s.
+your prompt and the C++ engine runs the whole SigLIP vision tower on the NPU
+before prefill. Each response streams token-by-token; the footer reports
+TTFT and decode tokens/s.
 
 Startup time:
 
@@ -145,17 +145,60 @@ Startup time:
 | `--text-only` | ~50 s (LM weights → NPU) + ~2 s warmup |
 | default (with vision) | ~75 s (LM + SigLIP → NPU) + ~2 s warmup |
 
-After that, **any new prompt shape is GPU-like** — no per-shape JIT cliff
-(see [SigLIP vision tower in C++](#4-siglip-vision-tower-in-c-no-torch_npu)
-for how Python avoids the per-shape `torch_npu` JIT compile that previously
-dominated first-token latency).
+After that, **any new prompt shape is GPU-like** — no per-shape JIT cliff.
+For multi-turn chat the engine keeps a per-conversation prefix cache (see
+[Prefix cache semantics](#prefix-cache-semantics) below) — though the first
+version doesn't yet eliminate the linear TTFT growth from the chat template
+trailing assistant marker; see the known limitation note.
 
-> ⚠ **Vision is single-slice for now.** The HF MiniCPM-V processor can split
-> high-res images into up to 9 sub-images for finer detail. The engine
-> currently runs the SigLIP tower over **one** 448×448 slice (32×32 patch
-> grid → 64 image tokens), and the Python side passes `max_slice_nums=1` to
-> the processor so token counts line up. High-res detail recognition is
-> reduced; multi-slice scatter is on the roadmap.
+### Vision slicing
+
+The HF MiniCPM-V processor can split a high-resolution image into one overview
+plus several ~448×448 sub-images. The engine now mirrors that scheme:
+
+- Python emits `image_slice_sizes = [[h0, w0], [h1, w1], ...]`
+- The engine slices the patch-strip `pixel_values` buffer along W
+- It runs the full SigLIP tower + vit_merger + merger.mlp **once per slice**
+- It finds the matching run of `image_token_id` placeholders in `input_ids`
+  and scatters the per-slice image features into `prompt_hidden`
+
+This is what lets larger images preserve OCR / fine detail. Example:
+- single-slice 448×448 gray image → “The image is completely gray...”
+- multi-slice 1024×768 synthetic test image with a yellow rectangle and the
+  word `HELLO` → “The image shows a yellow rectangle ... with the word
+  'HELLO' inside it.”
+
+> ⚠ Multi-slice is currently **single-image only**. Multiple uploaded images in
+> one turn still go through the processor, but the engine only wires the first
+> image-bearing slice group. True multi-image stitching is a follow-up.
+
+### Prefix cache semantics
+
+In `--server` mode the engine keeps a per-conversation cache keyed by
+`conversation_id`:
+
+- The engine retains the `DecodeState` (KV / recurrent caches + last hidden)
+  plus the exact token sequence that built it.
+- On the next request for the same `conversation_id`, the engine computes the
+  longest common prefix (LCP) against the new token list and tries to advance
+  only the new suffix through the per-token step path.
+- If the new request **diverges from the cached prefix in the middle** (history
+  edited, regenerate with a different last turn, etc.), the engine drops the
+  cache for that conversation and rebuilds from scratch.
+- Clear history in the Gradio UI generates a fresh `conversation_id`, which
+  drops the old prefix cache.
+
+> ⚠ **Known limitation today**: the HF chat template adds an
+> `<|im_start|>assistant ...` generation prompt at the end of every request.
+> When the next turn arrives, the previous request's tail (assistant marker
+> + EOS / turn-end tokens) doesn't fully line up with the engine's cached
+> token sequence, so the LCP comes up shorter than the cached prefix and the
+> engine has to rebuild. Until the bundle protocol separates "stable prefix"
+> from "per-turn tail", multi-turn TTFT still grows roughly linearly with
+> history length. The infrastructure to fix this — `conversation_id`,
+> persistent `DecodeState`, suffix step replay, LCP — is in place; it's the
+> tokenization layout that needs the next pass.
+
 
 ### CLI
 
@@ -169,11 +212,17 @@ source scripts/set_env.sh
 # Greedy generation from a text prompt.
 python3 src/python/run_hybrid.py --prompt "你好,介绍一下你自己"
 
+# Greedy generation with one image.
+python3 src/python/run_hybrid.py \
+    --prompt "What is in this image?" \
+    --image path/to/img.png
+
 # Compare engine logits against a PyTorch reference (regression sanity):
 python3 src/python/compare_logits.py
 ```
 
 For unit tests and the full bench suite, see [Diagnostics](#diagnostics).
+
 
 ## Key optimizations
 
@@ -330,16 +379,20 @@ can close.
 
 ## Roadmap
 
-- **Multi-slice vision** so high-res images keep their detail. The HF
-  MiniCPM-V processor splits images into up to 9 sub-images at full
-  resolution; the engine currently runs the SigLIP tower on a single 448×448
-  slice (~64 image tokens). Need to loop the tower N times and stitch
-  features into the prompt per slice.
+- **Exact-prefix retry cache** without full rebuild. The first conversation-cache
+  implementation already skips replaying old history when the next request
+  extends the prefix, but exact same-prefix retry/regenerate still conservatively
+  rebuilds because the engine only persists `last_hidden` for the most recent
+  committed prefix and not for arbitrary branch points.
+- **True multi-image support**. The engine already supports multi-slice for one
+  image; next step is multiple uploaded images in one turn, each with its own
+  slice group and placeholder run.
 - **Weight quantization** is the only remaining lever for serious tps gains.
   int8 halves the bytes read for every matmul → estimated ~10 tps. int4 →
   estimated ~14 tps. Will need dequant-fused matmul kernels on the cube path.
 - KV-cache offload to host for longer contexts (currently bounded by NPU memory).
 - Beam search / top-p sampling. Currently greedy-only.
+
 
 ## License
 

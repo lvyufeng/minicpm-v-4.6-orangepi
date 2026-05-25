@@ -9,7 +9,7 @@ runs on the NPU via the engine (no torch_npu). Run from the repo root:
     python3 src/python/gradio_app.py
 
 Then open http://localhost:7860 in a browser. Pass --share to expose via
-gradio's tunnel.
+Gradio's tunnel.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import argparse
 import os
 import sys
 import time
+import uuid
 
 # Make sibling `minicpmv` package importable when running this file directly.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,13 +29,11 @@ from minicpmv.session import MinicpmvSession  # noqa: E402
 
 
 def _entry_to_message(entry: dict) -> dict:
-    """Translate one gradio chat entry into an HF chat-template `messages` dict.
+    """Translate one Gradio chat entry into an HF chat-template `messages` dict.
 
-    Gradio's history `content` field is either:
-      - a plain str (text turn), or
-      - a tuple/list whose entries are filepaths or {"path": ...} dicts (media)
-      - in MultimodalTextbox the *current* message is a dict
-        {"text": str, "files": [paths or dicts]}.
+    History entries can contain plain text or image/file payloads. We preserve
+    the ordering so image placeholder tokens line up with the same positions in
+    the engine-side prefix cache.
     """
     role = entry["role"]
     raw = entry["content"]
@@ -62,7 +61,16 @@ def _entry_to_message(entry: dict) -> dict:
 
 
 def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
-    def chat_fn(message, history: list[dict]):
+    desc = (
+        "MiniCPM-V 4.6 streaming multimodal chat via the custom AscendC engine. "
+        "Vision encoder runs on the NPU (no torch_npu). Drop an image into "
+        "the message box to ask vision questions."
+    )
+
+    def new_conversation_id() -> str:
+        return str(uuid.uuid4())
+
+    def chat_fn(message, history: list[dict], conversation_id: str):
         messages = [_entry_to_message(e) for e in history]
         messages.append(_entry_to_message({"role": "user", "content": message}))
         t0 = time.time()
@@ -70,7 +78,9 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
         stats: dict = {}
         try:
             for _tok, text_chunk, stats in session.generate(
-                messages, max_new_tokens=max_new_tokens,
+                messages,
+                max_new_tokens=max_new_tokens,
+                conversation_id=conversation_id,
             ):
                 response += text_chunk
                 yield response
@@ -86,34 +96,47 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
                 f"ttft={ttft:.2f}s · decode={stats['tps']:.2f} tps</sub>"
             )
             yield response + footer
-        print(f"[chat_fn] {stats.get('token_count', 0)} tok in {time.time()-t0:.1f}s", flush=True)
+        print(
+            f"[chat_fn] conv={conversation_id[:8]} tokens={stats.get('token_count', 0)} "
+            f"elapsed={time.time()-t0:.1f}s",
+            flush=True,
+        )
 
-    desc = (
-        "MiniCPM-V 4.6 streaming multimodal chat via the custom AscendC engine. "
-        "Vision encoder runs on the NPU (no torch_npu). Drop an image into "
-        "the message box to ask vision questions."
-    )
-    return gr.ChatInterface(
-        fn=chat_fn,
-        multimodal=True,
-        title="MiniCPM-V 4.6 · Orange Pi AIPro 20T (Ascend 310B)",
-        description=desc,
-        textbox=gr.MultimodalTextbox(
+    def clear_chat() -> tuple[list, str]:
+        # New conversation_id forces engine-side prefix cache reset.
+        return [], new_conversation_id()
+
+    with gr.Blocks(title="MiniCPM-V 4.6 · Orange Pi AIPro 20T (Ascend 310B)") as demo:
+        gr.Markdown("# MiniCPM-V 4.6 · Orange Pi AIPro 20T (Ascend 310B)")
+        gr.Markdown(desc)
+
+        conv_id = gr.State(new_conversation_id())
+        chatbot = gr.Chatbot(type="messages", height=600)
+        msg = gr.MultimodalTextbox(
             file_types=["image"],
             placeholder="Type a message, optionally drop in an image…",
             file_count="multiple",
-        ),
-    )
+            show_label=False,
+        )
+        clear_btn = gr.Button("Clear history")
+
+        msg.submit(chat_fn, [msg, chatbot, conv_id], [chatbot])
+        clear_btn.click(clear_chat, outputs=[chatbot, conv_id])
+
+    return demo
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--host", default="0.0.0.0", help="Bind address")
     p.add_argument("--port", type=int, default=7860)
-    p.add_argument("--share", action="store_true", help="Expose via gradio tunnel")
+    p.add_argument("--share", action="store_true", help="Expose via Gradio tunnel")
     p.add_argument("--max-new-tokens", type=int, default=256)
-    p.add_argument("--text-only", action="store_true",
-                   help="Skip loading the vision tower (saves ~1.5 GB NPU + ~30s startup)")
+    p.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Skip loading the vision tower (saves ~1.5 GB NPU + ~30s startup)",
+    )
     return p.parse_args()
 
 
@@ -126,9 +149,10 @@ def main() -> int:
     # One warmup call to absorb the engine's first-time aclnn JIT.
     print("[gradio_app] warming engine (first-time aclnn JIT)…", flush=True)
     t0 = time.time()
+    warm_conv = str(uuid.uuid4())
     msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
     n = 0
-    for _ in session.generate(msg, max_new_tokens=4):
+    for _ in session.generate(msg, max_new_tokens=4, conversation_id=warm_conv):
         n += 1
     print(f"[gradio_app] warmup done: {n} tok in {time.time()-t0:.1f}s", flush=True)
     print("[gradio_app] ready", flush=True)

@@ -22,9 +22,10 @@ matmul 权重带宽吃掉;下一步只能上权重量化(见 [Roadmap](#roadmap)
 也已经移植到 C++/aclnn,端到端对照 HF CPU 参考实现验证过:最终给 LM 用的
 `image_features` 跟 HF 输出的 `max_abs_diff = 0.0098`(448×448 输入)。
 
-> ⚠ 当前只支持单 batch greedy decode。图像目前每张只跑**一个** 448×448 切片
-> (HF MiniCPM-V 的高分辨率多切片管线在 [Roadmap](#roadmap) 里)。不同的
-> MiniCPM-V 变体需要改 `language_model.cpp` 和 `vision.cpp` 里的 config。
+> ⚠ 当前只支持单 batch greedy decode。视觉会把高分辨率图片拆成最多 9 个
+> ~448×448 切片,每个切片各跑一次 SigLIP 塔(见
+> [视觉切片](#视觉切片))。不同的 MiniCPM-V 变体需要改 `language_model.cpp`
+> 和 `vision.cpp` 里的 config。
 
 ## 快速开始
 
@@ -109,8 +110,8 @@ huggingface-cli download openbmb/MiniCPM-V-4_6 \
 
 ### Web UI(Gradio)
 
-跑在 C++ 引擎上的流式多模态对话——文本 + 图片(单切片 448×448),
-不需要 torch_npu:
+跑在 C++ 引擎上的流式多模态对话——文本 + 图片,**多切片视觉已启用**,
+Python 端不依赖 `torch_npu`:
 
 ```bash
 # 一次性安装 Gradio(已经装过 transformers / pillow 的话只补这个)
@@ -134,16 +135,49 @@ python3 src/python/gradio_app.py --text-only  # 跳过 ~1.5 GB 的 vision tower
 | `--text-only` | ~50 s(LM 权重 → NPU)+ ~2 s warmup |
 | 默认(带视觉) | ~75 s(LM + SigLIP → NPU)+ ~2 s warmup |
 
-启动完之后,**任意新 prompt 长度都是 GPU 级体验**——没有按 shape 编译的 JIT
-卡顿(具体怎么做到的看
-[SigLIP vision tower in C++](#4-siglip-vision-tower-in-c-no-torch_npu)
-的说明,核心是 Python 端绕开了之前主导 ttft 的 `torch_npu` per-shape 编译)。
+启动完之后,**任意新 prompt 长度都是 GPU 级体验**——没有按 shape 编译的
+JIT 卡顿。多轮对话引擎会按 `conversation_id` 保留会话级前缀缓存(见
+[前缀缓存 (prefix cache)](#前缀缓存-prefix-cache)),不过当前版本还不能
+完全消除多轮 TTFT 的线性增长,详见那一节的已知限制说明。
 
-> ⚠ **当前只支持单切片视觉。** HF MiniCPM-V 的处理器会把高分辨率图片切成
-> 最多 9 个 sub-image 来保留细节。我们引擎现在只跑**一个** 448×448 切片
-> (32×32 patch 网格 → 64 个图像 token),Python 端给 processor 传
-> `max_slice_nums=1` 让 token 数对得上。高分辨率细节识别因此打了折扣;
-> 多切片支持在 roadmap 上。
+### 视觉切片
+
+HF MiniCPM-V 的处理器会把高分辨率图片切成 1 张概览 + 多个 ~448×448 子图,
+引擎现在按同样规则处理:
+
+- Python 端透出 `image_slice_sizes = [[h0, w0], [h1, w1], ...]`
+- 引擎按 W 切 patch-strip `pixel_values`
+- 对每个切片**各跑一次** SigLIP 塔 + vit_merger + merger.mlp
+- 找 `input_ids` 里对应的 `image_token_id` 连续段,把每片的 image features
+  scatter 到 `prompt_hidden`
+
+低分辨率图片只产生 1 个切片;高分辨率图片可以保留 OCR / 细节。比如
+1024×768 蓝底黄矩形+文字 HELLO 的图片会被切成 5 片,模型能识别出 “HELLO”
+那串字。
+
+> ⚠ 多切片当前**只支持单张图片**。同一轮上传多张图片仍会过处理器,但引擎只
+> 会接第一张图的切片组。真正的多图拼接是后续工作。
+
+### 前缀缓存 (prefix cache)
+
+`--server` 模式下,引擎按 `conversation_id` 在内存里保留每个会话的:
+
+- `DecodeState`(KV / 递归缓存 + 最后一个 hidden)
+- 构成该状态的完整 token 序列
+
+下一次请求带相同 `conversation_id` 进来时,引擎计算与缓存 token 序列的
+最长公共前缀(LCP),只对新增的 suffix 走逐 token step path 推进;LCP 之前
+的部分不会重新 prefill。中间被编辑过的历史(regenerate、改之前的轮)会
+触发缓存重建。Gradio "Clear history" 会生成新的 `conversation_id`,等价于
+丢弃旧缓存。
+
+> ⚠ **当前限制**:HF chat template 在每次请求末尾追加
+> `<|im_start|>assistant ...` 的 generation prompt。下一轮把这一段 +
+> 实际生成的回复拼回去之后,token 序列在“上一轮 user 尾巴 + assistant
+> marker”那段跟引擎已记录的不完全一致,所以 LCP 比缓存长度短,引擎要
+> 重建。会话基础设施(conversation_id、持久 DecodeState、suffix step
+> replay、LCP)都已经就位,但 token 布局这层还需要下一轮工作。
+
 
 ### CLI
 
