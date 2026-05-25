@@ -70,11 +70,13 @@ class MinicpmvSession:
         engine_bin: Optional[str] = None,
         custom_opp: Optional[str] = None,
         with_vision: bool = True,
+        max_slice_nums: int = 9,
     ) -> None:
         self.model_path = model_path or os.environ.get("MINICPMV_MODEL_PATH", DEFAULT_MODEL_PATH)
         self.engine_bin = engine_bin or os.environ.get("MINICPMV_ENGINE_BIN", DEFAULT_ENGINE_BIN)
         self.custom_opp = custom_opp or os.environ.get("MINICPMV_CUSTOM_OPP", DEFAULT_CUSTOM_OPP)
         self.with_vision = with_vision
+        self.max_slice_nums = max_slice_nums
 
         # CPU-only processor: tokenizer + chat template + image processor.
         # Holds no model weights, never touches the NPU.
@@ -180,11 +182,11 @@ class MinicpmvSession:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            # Disable MiniCPM-V's high-res slicing (default max_slice_nums=9
-            # creates up to ~9 sub-images per input image, which the engine's
-            # single-slice vision path doesn't yet handle). Single slice =
-            # one 32x32 patch grid = 64 image tokens.
-            max_slice_nums=1,
+            # max_slice_nums controls MiniCPM-V's high-res slicing. The HF
+            # processor splits one image into 1 overview + up to N-1
+            # sub-images (each ~448×448, aspect-ratio-respecting); the engine
+            # loops the vision tower per slice and stitches features.
+            max_slice_nums=self.max_slice_nums,
         )
         input_ids = inputs["input_ids"]
         if hasattr(input_ids, "tolist"):
@@ -197,22 +199,21 @@ class MinicpmvSession:
         pixel_values = inputs.get("pixel_values")
         target_sizes = inputs.get("target_sizes")
         if has_image and pixel_values is not None and target_sizes is not None:
-            # Only the first image (single-image conversations); multi-image
-            # would require iterating per-image and stitching scatter offsets.
             import numpy as np
             pv = pixel_values
             if hasattr(pv, "to") and hasattr(pv, "numpy"):
                 pv_np = pv[:1].to("cpu").contiguous().to(_dtype_fp16()).numpy()
             else:
                 pv_np = np.ascontiguousarray(pv).astype(np.float16)
+            # target_sizes is [N_slices, 2] — list out each [h, w] pair.
             ts = target_sizes
             if hasattr(ts, "tolist"):
-                target_h, target_w = int(ts[0][0]), int(ts[0][1])
+                ts_list = ts.tolist()
             else:
-                target_h, target_w = int(ts[0][0]), int(ts[0][1])
+                ts_list = [list(r) for r in ts]
+            slice_sizes = [[int(r[0]), int(r[1])] for r in ts_list]
             result["pixel_values"] = pv_np.tobytes()
-            result["target_h"] = target_h
-            result["target_w"] = target_w
+            result["slice_sizes"] = slice_sizes
         return result
 
     def _write_bundle(
@@ -250,8 +251,7 @@ class MinicpmvSession:
                 f.write(prepared["pixel_values"])
             side_paths.append(pixels_path)
             bundle["image_pixels_path"] = pixels_path
-            bundle["image_target_h"] = prepared["target_h"]
-            bundle["image_target_w"] = prepared["target_w"]
+            bundle["image_slice_sizes"] = prepared["slice_sizes"]
             bundle["image_token_id"] = IMAGE_TOKEN_ID
 
         with open(json_path, "w") as f:
