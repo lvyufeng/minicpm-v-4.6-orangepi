@@ -11,6 +11,19 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CUSTOM_OPS_DIR="$REPO_ROOT/src/csrc/custom_ops"
 INSTALL_DIR="${CUSTOM_OPP_INSTALL_DIR:-$REPO_ROOT/custom_opp_install}"
 
+# The AscendC build script expects ASCEND_HOME_PATH (or ASCEND_AICPU_PATH /
+# BASE_LIBS_PATH). Source the CANN env script if available and the user
+# hasn't already exported it.
+if [[ -z "${ASCEND_HOME_PATH:-}" && -z "${ASCEND_AICPU_PATH:-}" && -z "${BASE_LIBS_PATH:-}" ]]; then
+    CANN_ENV="${MINICPMV_ASCEND_TOOLKIT_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}/bin/setenv.bash"
+    if [[ -f "$CANN_ENV" ]]; then
+        # shellcheck disable=SC1090
+        source "$CANN_ENV"
+    else
+        export ASCEND_HOME_PATH="${MINICPMV_ASCEND_TOOLKIT_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
+    fi
+fi
+
 cd "$CUSTOM_OPS_DIR"
 ./build.sh
 

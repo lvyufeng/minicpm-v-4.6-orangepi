@@ -31,44 +31,55 @@ match to within `max_abs_diff = 0.0098` for a 448×448 input.
 > [Roadmap](#roadmap)). Different MiniCPM-V variants need config edits in
 > `language_model.cpp` and `vision.cpp`.
 
+## Quickstart
+
+End-to-end from a fresh clone, assuming an Orange Pi AIPro 20T with CANN
+already installed under `/usr/local/Ascend/ascend-toolkit/latest`:
+
+```bash
+# 0) install Python deps for the processor + Gradio (one-time).
+pip install transformers pillow gradio
+
+# 1) build & install the AscendC custom operators (cube matmul, fused
+#    SiLU·mul, etc.). Output: ./custom_opp_install/
+./scripts/install_custom_ops.sh
+
+# 2) build the engine (library + ~40 tests/benches/tools). Output: ./build/
+./scripts/build.sh
+
+# 3) download model weights (~5 GB) next to the repo.
+git lfs install
+git clone https://huggingface.co/openbmb/MiniCPM-V-4_6 MiniCPM-V-4.6
+
+# 4) source env and launch the multimodal web UI.
+source scripts/set_env.sh
+python3 src/python/gradio_app.py
+# → open http://localhost:7860, drop an image + ask a question.
+```
+
+Cold-start expectations: step 1 is ~3 min, step 2 ~1 min, step 4 takes
+~75 s to load model weights to NPU before serving the first request. Every
+request after that is GPU-like — no per-shape JIT cliff.
+
+If your CANN install lives elsewhere, set
+`MINICPMV_ASCEND_TOOLKIT_ROOT=/path/to/aarch64-linux` before step 1 and
+pass `-DASCEND_TOOLKIT_ROOT=...` to cmake in step 2.
+
 ## Hardware & software prerequisites
 
 - **Board**: Orange Pi AIPro 20T (or any Ascend 310B-based device)
 - **OS**: Ubuntu 22.04 aarch64
-- **CANN toolkit**: ≥ 7.0 at `/usr/local/Ascend/ascend-toolkit/latest/` (set
-  `MINICPMV_ASCEND_TOOLKIT_ROOT` if elsewhere)
+- **CANN toolkit**: 8.3.RC2 at `/usr/local/Ascend/ascend-toolkit/latest/`
+  (override with `MINICPMV_ASCEND_TOOLKIT_ROOT`)
 - **CMake**: ≥ 3.20
-- **Python**: 3.8+ with `torch`, `torch_npu`, `transformers` (only needed for
-  the Python helpers in `src/python/`, not the engine itself)
-
-## Layout
-
-```
-.
-├── README.md                    
-├── LICENSE                       Apache-2.0
-├── CMakeLists.txt                Engine library + per-test/per-bench targets
-├── scripts/
-│   ├── build.sh                  Configure + build the engine into build/
-│   ├── install_custom_ops.sh     Build + install the AscendC custom ops
-│   └── set_env.sh                Sources Ascend toolkit + custom_opp paths
-├── src/
-│   ├── csrc/                     C++ source tree
-│   │   ├── include/minicpmv/     Public headers (tensor, ops, layers, lm)
-│   │   ├── lib/                  Engine library implementation (.cpp)
-│   │   ├── tools/                User-runnable binaries (hybrid runner)
-│   │   └── custom_ops/           AscendC custom NPU kernels (own build system)
-│   └── python/                   Python helpers
-│       ├── run_hybrid.py         Python prompt prep + engine decode loop
-│       └── compare_logits.py     PyTorch reference vs engine logits diff
-├── tests/                        C++ unit & regression tests (28 files)
-└── bench/                        C++ benchmarks (8 NPU + 1 host DDR)
-```
-
-`MiniCPM-V-4.6/` (model weights, ~5 GB) is gitignored — see
-[Download the model](#download-the-model).
+- **Python**: 3.8+ with `transformers` ≥ 4.46 (for `MiniCPMV4_6Processor`)
+  and `pillow`. `gradio` for the web UI. `torch` / `torch_npu` are not
+  required on the inference path — they may be transitively installed by
+  `transformers` but no NPU op runs in Python.
 
 ## Build
+
+If you skipped the Quickstart and want to do the steps manually:
 
 ```bash
 # 1. Build and install the AscendC custom operators (cube matmul, fused
@@ -133,7 +144,9 @@ Startup time:
 | default (with vision) | ~75 s (LM + SigLIP → NPU) + ~2 s warmup |
 
 After that, **any new prompt shape is GPU-like** — no per-shape JIT cliff
-(see [Engine architecture notes](#engine-architecture)).
+(see [SigLIP vision tower in C++](#4-siglip-vision-tower-in-c-no-torch_npu)
+for how Python avoids the per-shape `torch_npu` JIT compile that previously
+dominated first-token latency).
 
 > ⚠ **Vision is single-slice for now.** The HF MiniCPM-V processor can split
 > high-res images into up to 9 sub-images for finer detail. The engine
