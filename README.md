@@ -1,5 +1,7 @@
 # MiniCPM-V 4.6 on Ascend 310B (Orange Pi AIPro 20T)
 
+[English](README.md) · [中文](README_ZH.md)
+
 A from-scratch C++/AscendC inference engine for [MiniCPM-V 4.6][minicpmv]
 on the Ascend 310B NPU in the Orange Pi AIPro 20T board. **Text and image
 chat both run entirely on the NPU through one engine subprocess — Python
