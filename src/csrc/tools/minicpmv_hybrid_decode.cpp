@@ -447,6 +447,10 @@ static void stream_generation_from_hidden(const Tensor& last_hidden,
         }
     }
     std::cout << "# done reason=" << reason << " steps=" << emitted << std::endl;
+    if (conv != nullptr) {
+        std::cerr << "[prefix-cache] post-gen prefix_input_ids.size()="
+                  << conv->prefix_input_ids.size() << std::endl;
+    }
     std::cout.flush();
 }
 
@@ -511,6 +515,8 @@ static void process_bundle(const std::string& bundle_path,
 
     auto it = conversations.find(b.conversation_id);
     if (it == conversations.end()) {
+        std::cerr << "[prefix-cache] NEW conv=" << b.conversation_id.substr(0, 8)
+                  << " request_len=" << request_ids.size() << std::endl;
         ConversationState& conv = rebuild();
         stream_generation_from_hidden(conv.last_hidden_1xH, b, w, cfg, cos_t, sin_t, &conv, &conv.state, stream);
         return;
@@ -525,6 +531,12 @@ static void process_bundle(const std::string& bundle_path,
 
     const int64_t lcp = longest_common_prefix(conv.prefix_input_ids, request_ids);
     const bool monotonic_extend = (lcp == static_cast<int64_t>(conv.prefix_input_ids.size()));
+    std::cerr << "[prefix-cache] conv=" << b.conversation_id.substr(0, 8)
+              << " stored_len=" << conv.prefix_input_ids.size()
+              << " request_len=" << request_ids.size()
+              << " lcp=" << lcp
+              << " hit=" << (monotonic_extend ? "yes" : "no")
+              << std::endl;
     if (!monotonic_extend) {
         ConversationState& fresh = rebuild();
         stream_generation_from_hidden(fresh.last_hidden_1xH, b, w, cfg, cos_t, sin_t, &fresh, &fresh.state, stream);

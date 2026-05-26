@@ -71,6 +71,27 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
         return str(uuid.uuid4())
 
     def chat_fn(message, history: list[dict], conversation_id: str):
+        # Append the user turn to the visible history right away so the UI
+        # shows it while the assistant streams. Gradio's messages-format
+        # Chatbot needs {"role", "content"} dicts; image attachments come
+        # in as files we mirror into the bubble.
+        user_text = ""
+        files: list[str] = []
+        if isinstance(message, dict):
+            user_text = message.get("text") or ""
+            for f in message.get("files", []) or []:
+                files.append(f["path"] if isinstance(f, dict) else f)
+        else:
+            user_text = str(message)
+
+        # Render user turn: file bubble(s) first, then the text.
+        new_history = list(history)
+        for path in files:
+            new_history.append({"role": "user", "content": {"path": path}})
+        if user_text:
+            new_history.append({"role": "user", "content": user_text})
+        new_history.append({"role": "assistant", "content": ""})
+
         messages = [_entry_to_message(e) for e in history]
         messages.append(_entry_to_message({"role": "user", "content": message}))
         t0 = time.time()
@@ -83,11 +104,13 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
                 conversation_id=conversation_id,
             ):
                 response += text_chunk
-                yield response
+                new_history[-1]["content"] = response
+                yield new_history
         except Exception as e:
             import traceback
             traceback.print_exc()
-            yield response + f"\n\n⚠ engine error: {e}"
+            new_history[-1]["content"] = response + f"\n\n⚠ engine error: {e}"
+            yield new_history
             return
         if stats:
             ttft = stats["elapsed_s"] - stats["decode_s"]
@@ -95,7 +118,8 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
                 f"\n\n<sub>{stats['token_count']} tok · "
                 f"ttft={ttft:.2f}s · decode={stats['tps']:.2f} tps</sub>"
             )
-            yield response + footer
+            new_history[-1]["content"] = response + footer
+            yield new_history
         print(
             f"[chat_fn] conv={conversation_id[:8]} tokens={stats.get('token_count', 0)} "
             f"elapsed={time.time()-t0:.1f}s",
@@ -111,7 +135,7 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
         gr.Markdown(desc)
 
         conv_id = gr.State(new_conversation_id())
-        chatbot = gr.Chatbot(type="messages", height=600)
+        chatbot = gr.Chatbot(height=600)
         msg = gr.MultimodalTextbox(
             file_types=["image"],
             placeholder="Type a message, optionally drop in an image…",
@@ -120,6 +144,8 @@ def build_app(session: MinicpmvSession, max_new_tokens: int = 256) -> gr.Blocks:
         )
         clear_btn = gr.Button("Clear history")
 
+        # The chat_fn yields the full updated history, so we wire the
+        # chatbot itself as both input and output.
         msg.submit(chat_fn, [msg, chatbot, conv_id], [chatbot])
         clear_btn.click(clear_chat, outputs=[chatbot, conv_id])
 

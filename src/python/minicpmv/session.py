@@ -85,6 +85,18 @@ class MinicpmvSession:
         # Persistent engine subprocess in --server mode.
         self._engine_proc: Optional[subprocess.Popen] = None
 
+        # Per-conversation accumulated token-id history. Keyed by
+        # conversation_id. Each value is the running input_ids that the engine
+        # has seen so far (prompt + every generated token). We append the next
+        # user turn's tokens to this directly instead of re-running
+        # apply_chat_template on the visible history — that re-runs would
+        # destroy the engine prefix cache because the chat template (a)
+        # injects an empty `<think>...</think>` block on every generation
+        # prompt and (b) rewrites *historical* assistant turns without those
+        # think wrappers. Accumulating tokens client-side keeps the engine
+        # prefix monotonically extending, so the cache LCP check always hits.
+        self._convs: Dict[str, List[int]] = {}
+
     def close(self) -> None:
         proc = self._engine_proc
         self._engine_proc = None
@@ -131,29 +143,43 @@ class MinicpmvSession:
             (token_id, decoded_text_chunk, stats) per token. Stats is a dict
             with token_count, elapsed_s, decode_s, tps for the current stream.
         """
-        prepared = self._prepare_inputs(messages)
+        prepared = self._prepare_inputs(messages, conversation_id)
         bundle_json, side_paths = self._write_bundle(prepared, max_new_tokens, conversation_id)
+        generated_tokens: List[int] = []
         try:
-            yield from self._run_engine_streaming(bundle_json)
+            for tok, text_chunk, stats in self._run_engine_streaming(bundle_json):
+                generated_tokens.append(tok)
+                yield tok, text_chunk, stats
         finally:
             for p in [bundle_json, *side_paths]:
                 try:
                     os.remove(p)
                 except OSError:
                     pass
+            # Persist the exact token stream the engine just saw for this
+            # conversation so the next turn appends rather than rebuilds.
+            if conversation_id:
+                self._convs[conversation_id] = list(prepared["input_ids"]) + generated_tokens
 
     # ----- Internals --------------------------------------------------------
 
-    def _prepare_inputs(self, messages: List[Dict]) -> Dict[str, Any]:
+    def _prepare_inputs(
+        self,
+        messages: List[Dict],
+        conversation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Run the HF processor (CPU) and return a normalised dict of bytes
         ready for the bundle:
             {
               'input_ids': List[int],
               'pixel_values': Optional[bytes],     # fp16 little-endian, naflex
-              'target_h': Optional[int],
-              'target_w': Optional[int],
+              'slice_sizes': Optional[List[[h, w]]],
             }
-        Only the first image in the message stream is currently handled.
+        When `conversation_id` is set and we have an existing entry, only the
+        latest user message is tokenised and appended to the engine-visible
+        token stream — bypassing chat_template's destructive rewriting of
+        historical assistant turns (it strips the `<think>` block from past
+        assistants, which is what breaks the engine prefix cache).
         """
         # Reject unsupported part types (audio/video) early.
         for m in messages:
@@ -166,16 +192,22 @@ class MinicpmvSession:
                             raise NotImplementedError(
                                 f"content part type {kind!r} not supported")
 
-        has_image = any(
-            isinstance(p, dict) and p.get("type") == "image"
-            for m in messages
-            if isinstance(m.get("content"), list)
-            for p in m["content"]
-        )
-        if has_image and not self.with_vision:
+        has_image_in_last_user_turn = self._last_user_has_image(messages)
+        if has_image_in_last_user_turn and not self.with_vision:
             raise RuntimeError("session was constructed with with_vision=False but "
                                "messages contain an image; recreate the session "
                                "with with_vision=True")
+
+        # Incremental path: if we already have a token stream stored for this
+        # conversation, only the trailing user turn is new. Tokenise just that
+        # turn (plus the assistant preamble the chat template appends) and
+        # append to the stored stream, so the engine sees a monotonically
+        # extending prefix.
+        prior = self._convs.get(conversation_id) if conversation_id else None
+        if prior is not None and not has_image_in_last_user_turn and messages and messages[-1].get("role") == "user":
+            suffix_ids = self._tokenize_user_turn_suffix(messages[-1])
+            new_ids = list(prior) + suffix_ids
+            return {"input_ids": new_ids}
 
         inputs = self.processor.apply_chat_template(
             messages,
@@ -199,7 +231,7 @@ class MinicpmvSession:
         result: Dict[str, Any] = {"input_ids": ids_list}
         pixel_values = inputs.get("pixel_values")
         target_sizes = inputs.get("target_sizes")
-        if has_image and pixel_values is not None and target_sizes is not None:
+        if has_image_in_last_user_turn and pixel_values is not None and target_sizes is not None:
             import numpy as np
             pv = pixel_values
             if hasattr(pv, "to") and hasattr(pv, "numpy"):
@@ -216,6 +248,52 @@ class MinicpmvSession:
             result["pixel_values"] = pv_np.tobytes()
             result["slice_sizes"] = slice_sizes
         return result
+
+    @staticmethod
+    def _last_user_has_image(messages: List[Dict]) -> bool:
+        if not messages:
+            return False
+        last = messages[-1]
+        if last.get("role") != "user":
+            return False
+        content = last.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(p, dict) and p.get("type") == "image"
+            for p in content
+        )
+
+    def _tokenize_user_turn_suffix(self, user_msg: Dict) -> List[int]:
+        """Tokenise the bytes the chat template would append for one more
+        user turn (with an empty `<think>...</think>` assistant preamble),
+        so the result can be concatenated onto a cached token stream.
+
+        Mirrors the relevant branches of `chat_template.jinja`:
+            <|im_start|>user\\n{content}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n
+        """
+        content = user_msg.get("content")
+        if isinstance(content, list):
+            parts: List[str] = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(p.get("text", ""))
+                elif isinstance(p, str):
+                    parts.append(p)
+            text = "\n".join(parts)
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = ""
+        rendered = (
+            "<|im_start|>user\n"
+            f"{text}"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n"
+        )
+        ids = self.processor.tokenizer(rendered, add_special_tokens=False)["input_ids"]
+        return [int(x) for x in ids]
 
     def _write_bundle(
         self,
