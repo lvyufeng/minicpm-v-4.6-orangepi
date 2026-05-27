@@ -16,6 +16,7 @@ enum class DType {
     Int32,
     Int64,
     UInt8,
+    Int8,
 };
 
 size_t dtype_size(DType dtype);

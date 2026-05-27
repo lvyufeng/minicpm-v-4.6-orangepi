@@ -92,6 +92,21 @@ void linear_causal_conv_step(const Tensor& x,
                              Tensor& out,
                              aclrtStream stream);
 
+// GPTQ W4A16 matmul, M=1 only. Replacement for `matmul_b_transposed` when the
+// model weight is GPTQ-quantized (sym=True, group_size=128). Inputs:
+//   x       fp16 [1, K]                       (K multiple of 128)
+//   w_int8  int8 [packed_rows, tile_len]      (tile-packed, q - zero)
+//   scales  fp16 [K/128, N]
+//   out     fp16 [1, N]
+// K and N must both be multiples of 128. tile_len is a multiple of 16 up to 448;
+// packed_rows is (K/128) * 8 * ceil((N/8)/tile_len) * 128.
+// All other GPTQ shapes (sym=False, group != 128) unsupported.
+void matmul_w4a16(const Tensor& x,
+                  const Tensor& w_int8,
+                  const Tensor& scales,
+                  Tensor& out,
+                  aclrtStream stream);
+
 // Linear-attention recurrent gated delta rule on NPU.
 // mixed:  [T, 6144] fp16 (post conv1d+SiLU), layout q|k|v contiguous over heads.
 // beta:   [T, 16]   fp16 (precomputed sigmoid(b))

@@ -24,6 +24,7 @@
 #include "aclnn_rms_norm1024_custom.h"
 #include "aclnn_linear_causal_conv_custom.h"
 #include "aclnn_linear_causal_conv_step_custom.h"
+#include "aclnn_matmul_w4a16_custom.h"
 #include "aclnn_linear_gated_delta_rule_custom.h"
 #include "aclnn_linear_gated_delta_rule_step_custom.h"
 #include "aclnn_gated_rms_norm_z_custom.h"
@@ -1021,6 +1022,73 @@ void linear_causal_conv_step(const Tensor& x,
         throw std::runtime_error("aclnnLinearCausalConvStepCustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
     run_op("aclnnLinearCausalConvStepCustom", ws_size, executor, stream, aclnnLinearCausalConvStepCustom);
+}
+
+void matmul_w4a16(const Tensor& x,
+                  const Tensor& w_int8,
+                  const Tensor& scales,
+                  Tensor& out,
+                  aclrtStream stream) {
+    // GPTQ W4A16 matmul (M=1 fast path). The weight has been pre-unpacked
+    // and block-packed by output-column chunks to match the custom kernel's 8-core split.
+    if (x.dtype() != DType::Float16) {
+        throw std::runtime_error("matmul_w4a16 x must be fp16");
+    }
+    if (w_int8.dtype() != DType::Int8) {
+        throw std::runtime_error("matmul_w4a16 w must be int8 (pre-unpacked from GPTQ)");
+    }
+    if (scales.dtype() != DType::Float16) {
+        throw std::runtime_error("matmul_w4a16 scales must be fp16");
+    }
+    if (out.dtype() != DType::Float16) {
+        throw std::runtime_error("matmul_w4a16 out must be fp16");
+    }
+    if (x.shape().size() != 2 || x.shape()[0] != 1) {
+        throw std::runtime_error("matmul_w4a16 x must be [1, K]");
+    }
+    const int64_t K = x.shape()[1];
+    constexpr int64_t G = 128;
+    if (scales.shape().size() != 2) {
+        throw std::runtime_error("matmul_w4a16 scales must be 2D");
+    }
+    const int64_t N = scales.shape()[1];
+    if (w_int8.shape().size() != 2) {
+        throw std::runtime_error("matmul_w4a16 w must be [packed_rows, tile_len]");
+    }
+    const int64_t tileLen = w_int8.shape()[1];
+    if (tileLen <= 0 || tileLen > 448 || tileLen % 16 != 0) {
+        throw std::runtime_error("matmul_w4a16 tile_len must be a multiple of 16 and <= 448");
+    }
+    if (K % G != 0 || N % 128 != 0) {
+        throw std::runtime_error("matmul_w4a16 K and N must be multiples of 128");
+    }
+    const int64_t blockLen = (N + 7) / 8;
+    const int64_t tilesPerBlock = (blockLen + tileLen - 1) / tileLen;
+    const int64_t packedRows = (K / G) * 8 * tilesPerBlock * G;
+    if (w_int8.shape()[0] != packedRows) {
+        throw std::runtime_error("matmul_w4a16 w packed_rows mismatch");
+    }
+    if (scales.shape() != std::vector<int64_t>{K / G, N}) {
+        throw std::runtime_error("matmul_w4a16 scales must be [K/128, N]");
+    }
+    if (out.shape() != std::vector<int64_t>{1, N}) {
+        throw std::runtime_error("matmul_w4a16 out must be [1, N]");
+    }
+
+    AclTensorHandle hx, hw, hs, ho;
+    make_acl_tensor(x, hx);
+    make_acl_tensor(w_int8, hw);
+    make_acl_tensor(scales, hs);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnMatmulW4a16CustomGetWorkspaceSize(hx.tensor, hw.tensor, hs.tensor,
+                                                       ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnMatmulW4a16CustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnMatmulW4a16Custom", ws_size, executor, stream, aclnnMatmulW4a16Custom);
 }
 
 void linear_gated_delta_rule(const Tensor& mixed,

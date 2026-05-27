@@ -1,0 +1,12 @@
+{
+  "op": "MatmulW4a16Custom",
+  "input_desc": [
+    {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "w", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+    {"name": "scales", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

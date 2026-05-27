@@ -14,6 +14,7 @@ size_t dtype_size(DType dtype) {
         case DType::Int32: return 4;
         case DType::Int64: return 8;
         case DType::UInt8: return 1;
+        case DType::Int8: return 1;
     }
     throw std::runtime_error("unknown dtype");
 }
@@ -26,6 +27,7 @@ aclDataType to_acl_dtype(DType dtype) {
         case DType::Int32: return ACL_INT32;
         case DType::Int64: return ACL_INT64;
         case DType::UInt8: return ACL_UINT8;
+        case DType::Int8: return ACL_INT8;
     }
     throw std::runtime_error("unknown dtype");
 }
