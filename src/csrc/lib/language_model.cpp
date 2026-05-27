@@ -2,6 +2,7 @@
 
 #include "minicpmv/acl_context.h"
 #include "minicpmv/ops.h"
+#include "minicpmv/quantized_weight.h"
 
 #include <algorithm>
 #include <cmath>
@@ -79,6 +80,22 @@ Tensor load_matmul_weight_transposed(WeightsIndex& index, int layer, const std::
     return dst;
 }
 
+std::string layer_base(int layer, const std::string& suffix) {
+    return "model.language_model.layers." + std::to_string(layer) + "." + suffix;
+}
+
+W4A16QuantizedWeight load_layer_w4a16_if_present(WeightsIndex& index, int layer, const std::string& suffix) {
+    const std::string base = layer_base(layer, suffix);
+    if (!has_w4a16_quantized_weight(index, base)) {
+        return {};
+    }
+    return load_w4a16_quantized_weight(index, base);
+}
+
+const W4A16QuantizedWeight* quant_ptr(const W4A16QuantizedWeight& w) {
+    return w.w_int8.data() == nullptr ? nullptr : &w;
+}
+
 // Transpose a causal-conv weight from canonical [C, K=4] (or [C, 1, K]) layout
 // into [K=4, C], so each of the 4 rows holds one tap's weights across all
 // channels — what `linear_causal_conv_step` expects.
@@ -132,9 +149,14 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
         lw.gate_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "mlp.gate_proj.weight");
         lw.up_w   = load_matmul_weight_transposed(index, static_cast<int>(layer), "mlp.up_proj.weight");
         lw.down_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "mlp.down_proj.weight");
+        lw.gate_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "mlp.gate_proj");
+        lw.up_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "mlp.up_proj");
+        lw.down_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "mlp.down_proj");
         if (cfg.layer_types[layer] == "linear_attention") {
             lw.qkv_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.in_proj_qkv.weight");
             lw.z_w   = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.in_proj_z.weight");
+            lw.qkv_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "linear_attn.in_proj_qkv");
+            lw.z_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "linear_attn.in_proj_z");
             lw.a_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.in_proj_a.weight");
             lw.b_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.in_proj_b.weight");
             lw.conv_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.conv1d.weight");
@@ -142,12 +164,17 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
             lw.a_log = load_layer_weight(index, static_cast<int>(layer), "linear_attn.A_log");
             lw.gated_norm_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.norm.weight");
             lw.out_proj_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.out_proj.weight");
+            lw.out_proj_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "linear_attn.out_proj");
             lw.conv_w_step_t = build_conv_step_weight(lw.conv_w);
         } else {
             lw.q_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.q_proj.weight");
             lw.k_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.k_proj.weight");
             lw.v_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.v_proj.weight");
             lw.o_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.o_proj.weight");
+            lw.q_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.q_proj");
+            lw.k_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.k_proj");
+            lw.v_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.v_proj");
+            lw.o_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.o_proj");
             lw.q_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.q_norm.weight");
             lw.k_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.k_norm.weight");
         }
@@ -232,6 +259,8 @@ void run_layer_step(int64_t layer,
             &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
             &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
             &lw.conv_w_step_t,
+            quant_ptr(lw.qkv_q), quant_ptr(lw.z_q), quant_ptr(lw.out_proj_q),
+            quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
         };
         linear_attention_decoder_layer_step(hidden, ww, lcfg, state.linear[linear_i], next, stream);
         ++linear_i;
@@ -241,6 +270,8 @@ void run_layer_step(int64_t layer,
         FullAttentionDecoderLayerWeights ww{
             &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
             &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+            quant_ptr(lw.q_q), quant_ptr(lw.k_q), quant_ptr(lw.v_q), quant_ptr(lw.o_q),
+            quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
         };
         full_attention_decoder_layer_step(hidden, ww, cos_table, sin_table,
                                           pos, cache_len, fcfg, state.full[full_i], next, stream);

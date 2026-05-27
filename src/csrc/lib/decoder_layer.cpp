@@ -200,6 +200,18 @@ inline bool matmul_shape_ok(const Tensor* t, int64_t N, int64_t K) {
     return s == std::vector<int64_t>{N, K} || s == std::vector<int64_t>{K, N};
 }
 
+void matmul_decode_dispatch(const Tensor& x,
+                            const Tensor* dense_weight,
+                            const W4A16QuantizedWeight* quant_weight,
+                            Tensor& out,
+                            aclrtStream stream) {
+    if (quant_weight != nullptr && x.shape().size() == 2 && x.shape()[0] == 1) {
+        matmul_w4a16(x, quant_weight->w_int8, quant_weight->scales, out, stream);
+        return;
+    }
+    matmul_b_transposed(x, *dense_weight, out, stream);
+}
+
 void validate_shapes(const Tensor& hidden,
                      const FullAttentionDecoderLayerWeights& w,
                      const FullAttentionDecoderLayerConfig& c,
@@ -916,9 +928,9 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     Tensor q_full({1, QProjOut}, DType::Float16); q_full.allocate();
     Tensor k_full({1, KVDim}, DType::Float16); k_full.allocate();
     Tensor v_full({1, KVDim}, DType::Float16); v_full.allocate();
-    matmul_b_transposed(normed, *weights.q_proj_weight, q_full, stream);
-    matmul_b_transposed(normed, *weights.k_proj_weight, k_full, stream);
-    matmul_b_transposed(normed, *weights.v_proj_weight, v_full, stream);
+    matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, q_full, stream);
+    matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, k_full, stream);
+    matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, v_full, stream);
 
     Tensor q_only({1, QMainDim}, DType::Float16); q_only.allocate();
     Tensor q_gate({1, QMainDim}, DType::Float16); q_gate.allocate();
@@ -959,7 +971,7 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
         sigmoid(q_gate, gate_sig, stream);
         Tensor attn_gated({1, QMainDim}, DType::Float16); attn_gated.allocate();
         mul(attn_out, gate_sig, attn_gated, stream);
-        matmul_b_transposed(attn_gated, *weights.o_proj_weight, attn_proj, stream);
+        matmul_decode_dispatch(attn_gated, weights.o_proj_weight, weights.o_proj_q, attn_proj, stream);
     }
 
     Tensor after_attn({1, Hidden}, DType::Float16); after_attn.allocate();
@@ -974,10 +986,10 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     Tensor gated({1, Intermediate}, DType::Float16); gated.allocate();
     Tensor mlp_out({1, Hidden}, DType::Float16); mlp_out.allocate();
 
-    matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
-    matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
+    matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, gate, stream);
+    matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, up, stream);
     silu_mul(gate, up, gated, stream);
-    matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
+    matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
 
@@ -1032,8 +1044,8 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     Tensor z({1, ValueDim}, DType::Float16); z.allocate();
     Tensor a({1, NumHeads}, DType::Float16); a.allocate();
     Tensor b({1, NumHeads}, DType::Float16); b.allocate();
-    matmul_b_transposed(normed, *weights.in_proj_qkv_weight, qkv, stream);
-    matmul_b_transposed(normed, *weights.in_proj_z_weight, z, stream);
+    matmul_decode_dispatch(normed, weights.in_proj_qkv_weight, weights.in_proj_qkv_q, qkv, stream);
+    matmul_decode_dispatch(normed, weights.in_proj_z_weight, weights.in_proj_z_q, z, stream);
     matmul_b_transposed(normed, *weights.in_proj_a_weight, a, stream);
     matmul_b_transposed(normed, *weights.in_proj_b_weight, b, stream);
 
@@ -1092,7 +1104,7 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     gated_rms_norm_z(core_dev, z_silu, *weights.gated_norm_weight, gated, stream);
 
     Tensor attn_proj({1, Hidden}, DType::Float16); attn_proj.allocate();
-    matmul_b_transposed(gated, *weights.out_proj_weight, attn_proj, stream);
+    matmul_decode_dispatch(gated, weights.out_proj_weight, weights.out_proj_q, attn_proj, stream);
 
     Tensor after_attn({1, Hidden}, DType::Float16); after_attn.allocate();
     add(hidden, attn_proj, after_attn, stream);
@@ -1106,10 +1118,10 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     Tensor gated_mlp({1, Intermediate}, DType::Float16); gated_mlp.allocate();
     Tensor mlp_out({1, Hidden}, DType::Float16); mlp_out.allocate();
 
-    matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
-    matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
+    matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, gate, stream);
+    matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, up, stream);
     silu_mul(gate, up, gated_mlp, stream);
-    matmul_b_transposed(gated_mlp, *weights.down_proj_weight, mlp_out, stream);
+    matmul_decode_dispatch(gated_mlp, weights.down_proj_weight, weights.down_proj_q, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
 

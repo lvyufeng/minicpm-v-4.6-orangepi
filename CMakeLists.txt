@@ -23,6 +23,7 @@ add_library(minicpmv_engine
   src/csrc/lib/tensor.cpp
   src/csrc/lib/weights.cpp
   src/csrc/lib/ops.cpp
+  src/csrc/lib/quantized_weight.cpp
   src/csrc/lib/decoder_layer.cpp
   src/csrc/lib/language_model.cpp
   src/csrc/lib/vision.cpp

@@ -26,10 +26,10 @@ static int choose_w4a16_tile_len(int N) {
     return std::max(16, tileLen);
 }
 
-static PackedW4a16Weight pack_w4a16_weight(const std::vector<int8_t>& w, int K, int N) {
+static PackedW4a16Weight pack_w4a16_weight(const std::vector<int8_t>& w, int K, int N, int forced_tile_len = 0) {
     constexpr int G = 128;
     constexpr int BlockNum = 8;
-    const int TileLen = choose_w4a16_tile_len(N);
+    const int TileLen = forced_tile_len > 0 ? forced_tile_len : choose_w4a16_tile_len(N);
     const int groups = K / G;
     const int blockLen = (N + BlockNum - 1) / BlockNum;
     const int tilesPerBlock = (blockLen + TileLen - 1) / TileLen;
@@ -74,24 +74,34 @@ int main(int argc, char** argv) {
 
     std::vector<uint16_t> hx(K, 0x3c00);
     std::vector<int8_t> hw(K * N, 1);
-    PackedW4a16Weight hpw = pack_w4a16_weight(hw, K, N);
-    w = Tensor({static_cast<int64_t>(hpw.data.size() / hpw.tile_len), hpw.tile_len}, DType::Int8);
-    w.allocate();
     std::vector<uint16_t> hs(NG * N, 0x3c00);
     x.copy_from_host(hx.data(), hx.size() * 2);
-    w.copy_from_host(hpw.data.data(), hpw.data.size());
     s.copy_from_host(hs.data(), hs.size() * 2);
 
-    // warm
-    for (int i = 0; i < 5; ++i) matmul_w4a16(x, w, s, out, ctx.stream());
-    aclrtSynchronizeStream(ctx.stream());
+    double best_w4a16_ms = 1e30;
+    int best_tile = 0;
+    const int default_tile = choose_w4a16_tile_len(N);
+    const int tile_candidates[] = {64, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, default_tile};
+    for (int tile : tile_candidates) {
+        if (tile <= 0 || tile > 448 || tile % 16 != 0) continue;
+        PackedW4a16Weight hpw = pack_w4a16_weight(hw, K, N, tile);
+        w = Tensor({static_cast<int64_t>(hpw.data.size() / hpw.tile_len), hpw.tile_len}, DType::Int8);
+        w.copy_from_host(hpw.data.data(), hpw.data.size());
 
-    auto t0 = clk::now();
-    for (int i = 0; i < iters; ++i) matmul_w4a16(x, w, s, out, ctx.stream());
-    aclrtSynchronizeStream(ctx.stream());
-    auto t1 = clk::now();
-    double w4a16_ms = ms(t0, t1) / iters;
-    std::printf("W4A16  K=%d N=%d  per_call_ms=%.3f  (%d iters)\n", K, N, w4a16_ms, iters);
+        for (int i = 0; i < 5; ++i) matmul_w4a16(x, w, s, out, ctx.stream());
+        aclrtSynchronizeStream(ctx.stream());
+
+        auto t0 = clk::now();
+        for (int i = 0; i < iters; ++i) matmul_w4a16(x, w, s, out, ctx.stream());
+        aclrtSynchronizeStream(ctx.stream());
+        auto t1 = clk::now();
+        double w4a16_ms = ms(t0, t1) / iters;
+        if (w4a16_ms < best_w4a16_ms) {
+            best_w4a16_ms = w4a16_ms;
+            best_tile = tile;
+        }
+        std::printf("W4A16  K=%d N=%d tile=%d  per_call_ms=%.3f  (%d iters)\n", K, N, tile, w4a16_ms, iters);
+    }
 
     // --- fp16 cube reference ---
     Tensor xf({1, K}, DType::Float16); xf.allocate(); xf.copy_from_host(hx.data(), hx.size() * 2);
@@ -104,12 +114,12 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 5; ++i) matmul_b_transposed(xf, wf, outf, ctx.stream());
     aclrtSynchronizeStream(ctx.stream());
 
-    t0 = clk::now();
+    auto t0 = clk::now();
     for (int i = 0; i < iters; ++i) matmul_b_transposed(xf, wf, outf, ctx.stream());
     aclrtSynchronizeStream(ctx.stream());
-    t1 = clk::now();
+    auto t1 = clk::now();
     double fp16_ms = ms(t0, t1) / iters;
     std::printf("fp16   K=%d N=%d  per_call_ms=%.3f  (%d iters)\n", K, N, fp16_ms, iters);
-    std::printf("speedup W4A16 vs fp16: %.2fx\n", fp16_ms / w4a16_ms);
+    std::printf("best W4A16 tile=%d per_call_ms=%.3f speedup vs fp16: %.2fx\n", best_tile, best_w4a16_ms, fp16_ms / best_w4a16_ms);
     return 0;
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "minicpmv/quantized_weight.h"
 #include "minicpmv/tensor.h"
 
 #include <acl/acl.h>
@@ -30,6 +31,16 @@ struct FullAttentionDecoderLayerWeights {
     const Tensor* gate_proj_weight;
     const Tensor* up_proj_weight;
     const Tensor* down_proj_weight;
+
+    // Optional W4A16 companions used only by the T=1 decode step path. When
+    // null or unallocated, the step falls back to the dense fp16 projection.
+    const W4A16QuantizedWeight* q_proj_q{nullptr};
+    const W4A16QuantizedWeight* k_proj_q{nullptr};
+    const W4A16QuantizedWeight* v_proj_q{nullptr};
+    const W4A16QuantizedWeight* o_proj_q{nullptr};
+    const W4A16QuantizedWeight* gate_proj_q{nullptr};
+    const W4A16QuantizedWeight* up_proj_q{nullptr};
+    const W4A16QuantizedWeight* down_proj_q{nullptr};
 };
 
 void full_attention_decoder_layer(const Tensor& hidden,
@@ -101,6 +112,13 @@ struct LinearAttentionDecoderLayerWeights {
     // set, the step path uses the vectorized linear_causal_conv_step kernel
     // instead of the generic causal conv + last-row extract.
     const Tensor* conv1d_step_weight{nullptr};
+
+    const W4A16QuantizedWeight* in_proj_qkv_q{nullptr};
+    const W4A16QuantizedWeight* in_proj_z_q{nullptr};
+    const W4A16QuantizedWeight* out_proj_q{nullptr};
+    const W4A16QuantizedWeight* gate_proj_q{nullptr};
+    const W4A16QuantizedWeight* up_proj_q{nullptr};
+    const W4A16QuantizedWeight* down_proj_q{nullptr};
 };
 
 void linear_attention_decoder_layer(const Tensor& hidden,

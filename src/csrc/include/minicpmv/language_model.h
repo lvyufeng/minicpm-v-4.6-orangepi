@@ -1,6 +1,7 @@
 #pragma once
 
 #include "minicpmv/decoder_layer.h"
+#include "minicpmv/quantized_weight.h"
 #include "minicpmv/tensor.h"
 #include "minicpmv/weights.h"
 
@@ -53,6 +54,21 @@ struct LanguageModelLayerWeights {
     Tensor o_w;
     Tensor q_norm_w;
     Tensor k_norm_w;
+
+    // Optional W4A16 quantized companions, populated when the safetensors index
+    // contains a GPTQ or AWQ tensor group for the corresponding projection.
+    // Only the matmuls listed in the decode-step path consult them; prefill and
+    // unsupported projections continue to use the dense fp16 fields above.
+    W4A16QuantizedWeight gate_q;
+    W4A16QuantizedWeight up_q;
+    W4A16QuantizedWeight down_q;
+    W4A16QuantizedWeight qkv_q;
+    W4A16QuantizedWeight z_q;
+    W4A16QuantizedWeight out_proj_q;
+    W4A16QuantizedWeight q_q;
+    W4A16QuantizedWeight k_q;
+    W4A16QuantizedWeight v_q;
+    W4A16QuantizedWeight o_q;
 };
 
 struct LmHeadChunk {
