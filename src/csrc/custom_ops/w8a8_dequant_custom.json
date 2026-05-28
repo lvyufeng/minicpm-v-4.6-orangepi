@@ -1,0 +1,12 @@
+{
+  "op": "W8a8DequantCustom",
+  "input_desc": [
+    {"name": "acc", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+    {"name": "xScale", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "wScale", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

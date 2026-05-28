@@ -25,6 +25,9 @@
 #include "aclnn_linear_causal_conv_custom.h"
 #include "aclnn_linear_causal_conv_step_custom.h"
 #include "aclnn_matmul_w4a16_custom.h"
+#include "aclnn_matmul_w8a8_i32_custom.h"
+#include "aclnn_w8a8_quantize_custom.h"
+#include "aclnn_w8a8_dequant_custom.h"
 #include "aclnn_linear_gated_delta_rule_custom.h"
 #include "aclnn_linear_gated_delta_rule_step_custom.h"
 #include "aclnn_gated_rms_norm_z_custom.h"
@@ -1089,6 +1092,121 @@ void matmul_w4a16(const Tensor& x,
         throw std::runtime_error("aclnnMatmulW4a16CustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
     run_op("aclnnMatmulW4a16Custom", ws_size, executor, stream, aclnnMatmulW4a16Custom);
+}
+
+void matmul_w8a8_i32(const Tensor& x,
+                     const Tensor& w_int8,
+                     Tensor& out,
+                     aclrtStream stream) {
+    if (x.dtype() != DType::Int8) {
+        throw std::runtime_error("matmul_w8a8_i32 x must be int8");
+    }
+    if (w_int8.dtype() != DType::Int8) {
+        throw std::runtime_error("matmul_w8a8_i32 w must be int8");
+    }
+    if (out.dtype() != DType::Int32) {
+        throw std::runtime_error("matmul_w8a8_i32 out must be int32");
+    }
+    if (x.shape().size() != 2 || x.shape()[0] != 1) {
+        throw std::runtime_error("matmul_w8a8_i32 x must be [1, K]");
+    }
+    if (w_int8.shape().size() != 2 || w_int8.shape()[0] != x.shape()[1]) {
+        throw std::runtime_error("matmul_w8a8_i32 w must be [K, N]");
+    }
+    if (out.shape() != std::vector<int64_t>{1, w_int8.shape()[1]}) {
+        throw std::runtime_error("matmul_w8a8_i32 out must be [1, N]");
+    }
+
+    AclTensorHandle hx, hw, ho;
+    make_acl_tensor(x, hx);
+    make_acl_tensor(w_int8, hw);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnMatmulW8a8I32CustomGetWorkspaceSize(hx.tensor, hw.tensor,
+                                                         ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnMatmulW8a8I32CustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnMatmulW8a8I32Custom", ws_size, executor, stream, aclnnMatmulW8a8I32Custom);
+}
+
+void w8a8_quantize(const Tensor& x,
+                   Tensor& x_int8,
+                   Tensor& x_scale,
+                   aclrtStream stream) {
+    if (x.dtype() != DType::Float16) {
+        throw std::runtime_error("w8a8_quantize x must be fp16");
+    }
+    if (x_int8.dtype() != DType::Int8) {
+        throw std::runtime_error("w8a8_quantize x_int8 must be int8");
+    }
+    if (x_scale.dtype() != DType::Float16) {
+        throw std::runtime_error("w8a8_quantize x_scale must be fp16");
+    }
+    if (x.shape().size() != 2 || x.shape()[0] != 1) {
+        throw std::runtime_error("w8a8_quantize x must be [1, K]");
+    }
+    if (x_int8.shape() != x.shape()) {
+        throw std::runtime_error("w8a8_quantize x_int8 must match x shape");
+    }
+    if (x_scale.shape() != std::vector<int64_t>{1}) {
+        throw std::runtime_error("w8a8_quantize x_scale must be [1]");
+    }
+
+    AclTensorHandle hx, hxq, hs;
+    make_acl_tensor(x, hx);
+    make_acl_tensor(x_int8, hxq);
+    make_acl_tensor(x_scale, hs);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnW8a8QuantizeCustomGetWorkspaceSize(hx.tensor, hxq.tensor, hs.tensor,
+                                                        &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnW8a8QuantizeCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnW8a8QuantizeCustom", ws_size, executor, stream, aclnnW8a8QuantizeCustom);
+}
+
+void w8a8_dequant(const Tensor& acc,
+                  const Tensor& x_scale,
+                  const Tensor& w_scale,
+                  Tensor& out,
+                  aclrtStream stream) {
+    if (acc.dtype() != DType::Int32 || x_scale.dtype() != DType::Float16 ||
+        w_scale.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("w8a8_dequant requires int32 acc, fp16 scales, fp16 out");
+    }
+    if (acc.shape().size() != 2 || acc.shape()[0] != 1) {
+        throw std::runtime_error("w8a8_dequant acc must be [1, N]");
+    }
+    const int64_t N = acc.shape()[1];
+    if (x_scale.shape() != std::vector<int64_t>{1}) {
+        throw std::runtime_error("w8a8_dequant x_scale must be [1]");
+    }
+    if (w_scale.shape() != std::vector<int64_t>{N}) {
+        throw std::runtime_error("w8a8_dequant w_scale must be [N]");
+    }
+    if (out.shape() != std::vector<int64_t>{1, N}) {
+        throw std::runtime_error("w8a8_dequant out must be [1, N]");
+    }
+
+    AclTensorHandle ha, hxs, hws, ho;
+    make_acl_tensor(acc, ha);
+    make_acl_tensor(x_scale, hxs);
+    make_acl_tensor(w_scale, hws);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnW8a8DequantCustomGetWorkspaceSize(ha.tensor, hxs.tensor, hws.tensor,
+                                                       ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnW8a8DequantCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnW8a8DequantCustom", ws_size, executor, stream, aclnnW8a8DequantCustom);
 }
 
 void linear_gated_delta_rule(const Tensor& mixed,

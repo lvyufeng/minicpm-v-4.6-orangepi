@@ -69,12 +69,24 @@ struct LanguageModelLayerWeights {
     W4A16QuantizedWeight k_q;
     W4A16QuantizedWeight v_q;
     W4A16QuantizedWeight o_q;
+
+    W8A8QuantizedWeight gate_w8;
+    W8A8QuantizedWeight up_w8;
+    W8A8QuantizedWeight down_w8;
+    W8A8QuantizedWeight qkv_w8;
+    W8A8QuantizedWeight z_w8;
+    W8A8QuantizedWeight out_proj_w8;
+    W8A8QuantizedWeight q_w8;
+    W8A8QuantizedWeight k_w8;
+    W8A8QuantizedWeight v_w8;
+    W8A8QuantizedWeight o_w8;
 };
 
 struct LmHeadChunk {
     int64_t start_vocab{0};
     // Pre-transposed [K=hidden_size, N=chunk_vocab] fp16 cube-safe chunk.
     Tensor weight_kn;
+    W8A8QuantizedWeight weight_w8;
 };
 
 struct LanguageModelWeights {

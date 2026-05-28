@@ -107,6 +107,24 @@ void matmul_w4a16(const Tensor& x,
                   Tensor& out,
                   aclrtStream stream);
 
+// Raw W8A8 dot product for M=1 experiments. Computes int32 out = int8 x @ int8 w.
+// x: [1, K], w: [K, N], out: [1, N].
+void matmul_w8a8_i32(const Tensor& x,
+                     const Tensor& w_int8,
+                     Tensor& out,
+                     aclrtStream stream);
+
+void w8a8_quantize(const Tensor& x,
+                   Tensor& x_int8,
+                   Tensor& x_scale,
+                   aclrtStream stream);
+
+void w8a8_dequant(const Tensor& acc,
+                  const Tensor& x_scale,
+                  const Tensor& w_scale,
+                  Tensor& out,
+                  aclrtStream stream);
+
 // Linear-attention recurrent gated delta rule on NPU.
 // mixed:  [T, 6144] fp16 (post conv1d+SiLU), layout q|k|v contiguous over heads.
 // beta:   [T, 16]   fp16 (precomputed sigmoid(b))

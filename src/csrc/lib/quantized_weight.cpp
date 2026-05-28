@@ -1,7 +1,9 @@
 #include "minicpmv/quantized_weight.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -157,6 +159,48 @@ HostW4A16Weight unpack_awq_weight(const WeightsIndex& index, const std::string& 
     return HostW4A16Weight{K, N, groups, std::move(unpacked), std::move(scales)};
 }
 
+float f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t out;
+    if (exp == 0) {
+        if (mant == 0) {
+            out = sign;
+        } else {
+            int32_t e = 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; --e; }
+            mant &= 0x03ffu;
+            out = sign | (static_cast<uint32_t>(e + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
+uint16_t f32_to_f16_bits(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) return static_cast<uint16_t>(sign);
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+int8_t quantize_i8(float value, float inv_scale) {
+    float q = value * inv_scale;
+    if (q > 127.0f) q = 127.0f;
+    if (q < -128.0f) q = -128.0f;
+    return static_cast<int8_t>(q >= 0.0f ? q + 0.5f : q - 0.5f);
+}
+
 }  // namespace
 
 bool has_w4a16_quantized_weight(const WeightsIndex& index, const std::string& base) {
@@ -181,6 +225,45 @@ W4A16QuantizedWeight load_w4a16_quantized_weight(const WeightsIndex& index, cons
     out.w_int8.copy_from_host(packed.second.data(), packed.second.size());
     out.scales = Tensor({host.groups, host.N}, DType::Float16);
     out.scales.copy_from_host(host.scales.data(), host.scales.size() * sizeof(uint16_t));
+    return out;
+}
+
+W8A8QuantizedWeight quantize_dense_weight_w8a8(const Tensor& weight_kn) {
+    if (weight_kn.dtype() != DType::Float16 || weight_kn.shape().size() != 2) {
+        throw std::runtime_error("W8A8 dense weight source must be fp16 [K, N]");
+    }
+    const int64_t K = weight_kn.shape()[0];
+    const int64_t N = weight_kn.shape()[1];
+    if (K <= 0 || N <= 0 || (N % 16) != 0) {
+        throw std::runtime_error("W8A8 dense weight shape must have positive K and N multiple of 16");
+    }
+
+    std::vector<uint16_t> h(static_cast<size_t>(K) * N);
+    weight_kn.copy_to_host(h.data(), h.size() * sizeof(uint16_t));
+    std::vector<int8_t> q(h.size());
+    std::vector<uint16_t> scales(static_cast<size_t>(N));
+    for (int64_t n = 0; n < N; ++n) {
+        float max_abs = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+            max_abs = std::max(max_abs, std::fabs(f16_bits_to_f32(h[static_cast<size_t>(k) * N + n])));
+        }
+        float scale = max_abs / 127.0f;
+        if (scale < 0.00000001f) scale = 0.00000001f;
+        const float inv = 1.0f / scale;
+        scales[static_cast<size_t>(n)] = f32_to_f16_bits(scale);
+        for (int64_t k = 0; k < K; ++k) {
+            const size_t idx = static_cast<size_t>(k) * N + n;
+            q[idx] = quantize_i8(f16_bits_to_f32(h[idx]), inv);
+        }
+    }
+
+    W8A8QuantizedWeight out;
+    out.K = K;
+    out.N = N;
+    out.w_int8 = Tensor({K, N}, DType::Int8);
+    out.w_int8.copy_from_host(q.data(), q.size());
+    out.w_scale = Tensor({N}, DType::Float16);
+    out.w_scale.copy_from_host(scales.data(), scales.size() * sizeof(uint16_t));
     return out;
 }
 

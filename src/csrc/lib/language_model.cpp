@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,29 @@ namespace minicpmv {
 
 namespace {
 
+const std::string& w8a8_decode_mode() {
+    static const std::string mode = [] {
+        const char* v = std::getenv("MINICPM_W8A8_DECODE");
+        return v == nullptr ? std::string{} : std::string(v);
+    }();
+    return mode;
+}
+
+bool w8a8_decode_enabled() {
+    const std::string& mode = w8a8_decode_mode();
+    return !mode.empty() && mode != "0" && mode != "false";
+}
+
+bool w8a8_policy_allows(const char* token) {
+    if (!w8a8_decode_enabled()) return false;
+    const std::string& mode = w8a8_decode_mode();
+    if (mode == "all") return true;
+    const std::string t(token);
+    if (mode == "1" || mode == "selective") {
+        return t == "lm_head";
+    }
+    return mode.find(t) != std::string::npos;
+}
 uint16_t f32_to_f16_bits(float f) {
     uint32_t x;
     std::memcpy(&x, &f, sizeof(x));
@@ -96,6 +120,10 @@ const W4A16QuantizedWeight* quant_ptr(const W4A16QuantizedWeight& w) {
     return w.w_int8.data() == nullptr ? nullptr : &w;
 }
 
+const W8A8QuantizedWeight* quant_ptr(const W8A8QuantizedWeight& w) {
+    return w.w_int8.data() == nullptr ? nullptr : &w;
+}
+
 // Transpose a causal-conv weight from canonical [C, K=4] (or [C, 1, K]) layout
 // into [K=4, C], so each of the 4 rows holds one tap's weights across all
 // channels — what `linear_causal_conv_step` expects.
@@ -142,6 +170,7 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
     w.embed = load_weight(index, "model.language_model.embed_tokens.weight");
     w.final_norm_w = load_weight(index, "model.language_model.norm.weight");
     w.layers.resize(cfg.num_layers);
+    const bool use_w8a8 = w8a8_decode_enabled();
     for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
         auto& lw = w.layers[layer];
         lw.input_norm_w = load_layer_weight(index, static_cast<int>(layer), "input_layernorm.weight");
@@ -152,6 +181,11 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
         lw.gate_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "mlp.gate_proj");
         lw.up_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "mlp.up_proj");
         lw.down_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "mlp.down_proj");
+        if (w8a8_policy_allows("mlp")) {
+            lw.gate_w8 = quantize_dense_weight_w8a8(lw.gate_w);
+            lw.up_w8 = quantize_dense_weight_w8a8(lw.up_w);
+            lw.down_w8 = quantize_dense_weight_w8a8(lw.down_w);
+        }
         if (cfg.layer_types[layer] == "linear_attention") {
             lw.qkv_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.in_proj_qkv.weight");
             lw.z_w   = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.in_proj_z.weight");
@@ -165,6 +199,15 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
             lw.gated_norm_w = load_layer_weight(index, static_cast<int>(layer), "linear_attn.norm.weight");
             lw.out_proj_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "linear_attn.out_proj.weight");
             lw.out_proj_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "linear_attn.out_proj");
+            if (w8a8_policy_allows("linear_qkv")) {
+                lw.qkv_w8 = quantize_dense_weight_w8a8(lw.qkv_w);
+            }
+            if (w8a8_policy_allows("linear_z")) {
+                lw.z_w8 = quantize_dense_weight_w8a8(lw.z_w);
+            }
+            if (w8a8_policy_allows("linear_out")) {
+                lw.out_proj_w8 = quantize_dense_weight_w8a8(lw.out_proj_w);
+            }
             lw.conv_w_step_t = build_conv_step_weight(lw.conv_w);
         } else {
             lw.q_w = load_matmul_weight_transposed(index, static_cast<int>(layer), "self_attn.q_proj.weight");
@@ -175,6 +218,18 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
             lw.k_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.k_proj");
             lw.v_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.v_proj");
             lw.o_q = load_layer_w4a16_if_present(index, static_cast<int>(layer), "self_attn.o_proj");
+            if (w8a8_policy_allows("full_q")) {
+                lw.q_w8 = quantize_dense_weight_w8a8(lw.q_w);
+            }
+            if (w8a8_policy_allows("full_k")) {
+                lw.k_w8 = quantize_dense_weight_w8a8(lw.k_w);
+            }
+            if (w8a8_policy_allows("full_v")) {
+                lw.v_w8 = quantize_dense_weight_w8a8(lw.v_w);
+            }
+            if (w8a8_policy_allows("full_o")) {
+                lw.o_w8 = quantize_dense_weight_w8a8(lw.o_w);
+            }
             lw.q_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.q_norm.weight");
             lw.k_norm_w = load_layer_weight(index, static_cast<int>(layer), "self_attn.k_norm.weight");
         }
@@ -208,6 +263,9 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
         chunk.start_vocab = start;
         chunk.weight_kn = Tensor({H, kChunkN}, DType::Float16);
         chunk.weight_kn.copy_from_host(chunk_host.data(), chunk_host.size() * sizeof(uint16_t));
+        if (w8a8_policy_allows("lm_head")) {
+            chunk.weight_w8 = quantize_dense_weight_w8a8(chunk.weight_kn);
+        }
         w.lm_head_chunks.push_back(std::move(chunk));
     }
 
@@ -261,6 +319,8 @@ void run_layer_step(int64_t layer,
             &lw.conv_w_step_t,
             quant_ptr(lw.qkv_q), quant_ptr(lw.z_q), quant_ptr(lw.out_proj_q),
             quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
+            quant_ptr(lw.qkv_w8), quant_ptr(lw.z_w8), quant_ptr(lw.out_proj_w8),
+            quant_ptr(lw.gate_w8), quant_ptr(lw.up_w8), quant_ptr(lw.down_w8),
         };
         linear_attention_decoder_layer_step(hidden, ww, lcfg, state.linear[linear_i], next, stream);
         ++linear_i;
@@ -272,6 +332,8 @@ void run_layer_step(int64_t layer,
             &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w, &lw.down_w,
             quant_ptr(lw.q_q), quant_ptr(lw.k_q), quant_ptr(lw.v_q), quant_ptr(lw.o_q),
             quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
+            quant_ptr(lw.q_w8), quant_ptr(lw.k_w8), quant_ptr(lw.v_w8), quant_ptr(lw.o_w8),
+            quant_ptr(lw.gate_w8), quant_ptr(lw.up_w8), quant_ptr(lw.down_w8),
         };
         full_attention_decoder_layer_step(hidden, ww, cos_table, sin_table,
                                           pos, cache_len, fcfg, state.full[full_i], next, stream);
@@ -365,6 +427,20 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
     Tensor logits({1, kChunkN}, DType::Float16); logits.allocate();
     std::vector<uint16_t> logits_host(static_cast<size_t>(kChunkN));
 
+    const bool use_w8a8 = w8a8_decode_enabled();
+    Tensor logits_i32;
+    Tensor normed_i8;
+    Tensor normed_scale;
+    if (use_w8a8) {
+        logits_i32 = Tensor({1, kChunkN}, DType::Int32);
+        logits_i32.allocate();
+        normed_i8 = Tensor({1, cfg.hidden_size}, DType::Int8);
+        normed_i8.allocate();
+        normed_scale = Tensor({1}, DType::Float16);
+        normed_scale.allocate();
+        w8a8_quantize(normed, normed_i8, normed_scale, stream);
+    }
+
     auto h2f = [](uint16_t h) -> float {
         uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
         uint32_t exp = (h >> 10) & 0x1fu;
@@ -386,7 +462,12 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
     float best_logit = -std::numeric_limits<float>::infinity();
 
     for (const auto& chunk : w.lm_head_chunks) {
-        matmul_b_transposed(normed, chunk.weight_kn, logits, stream);
+        if (use_w8a8 && chunk.weight_w8.w_int8.data() != nullptr) {
+            matmul_w8a8_i32(normed_i8, chunk.weight_w8.w_int8, logits_i32, stream);
+            w8a8_dequant(logits_i32, normed_scale, chunk.weight_w8.w_scale, logits, stream);
+        } else {
+            matmul_b_transposed(normed, chunk.weight_kn, logits, stream);
+        }
         logits.copy_to_host(logits_host.data(), logits_host.size() * sizeof(uint16_t));
         const int64_t valid = std::min<int64_t>(kChunkN, cfg.vocab_size - chunk.start_vocab);
         for (int64_t i = 0; i < valid; ++i) {

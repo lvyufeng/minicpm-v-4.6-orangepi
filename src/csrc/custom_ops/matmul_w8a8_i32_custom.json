@@ -1,0 +1,11 @@
+{
+  "op": "MatmulW8a8I32Custom",
+  "input_desc": [
+    {"name": "x", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+    {"name": "w", "param_type": "required", "format": ["ND"], "type": ["int8"]}
+  ],
+  "output_desc": [
+    {"name": "out", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+  ],
+  "attr": []
+}

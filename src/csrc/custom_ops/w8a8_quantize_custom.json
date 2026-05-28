@@ -1,0 +1,11 @@
+{
+  "op": "W8a8QuantizeCustom",
+  "input_desc": [
+    {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "xq", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+    {"name": "scale", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": []
+}

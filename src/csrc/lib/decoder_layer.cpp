@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,14 @@
 
 namespace minicpmv {
 namespace {
+
+bool w8a8_decode_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MINICPM_W8A8_DECODE");
+        return v != nullptr && std::string(v) != "0" && std::string(v) != "false";
+    }();
+    return enabled;
+}
 
 uint16_t f32_to_f16_bits(float f) {
     uint32_t x;
@@ -200,11 +209,33 @@ inline bool matmul_shape_ok(const Tensor* t, int64_t N, int64_t K) {
     return s == std::vector<int64_t>{N, K} || s == std::vector<int64_t>{K, N};
 }
 
+bool w8a8_weight_ready(const W8A8QuantizedWeight* w8_weight) {
+    return w8a8_decode_enabled() && w8_weight != nullptr && w8_weight->w_int8.data() != nullptr;
+}
+
+void matmul_decode_w8a8_prequant(const Tensor& x_int8,
+                                 const Tensor& x_scale,
+                                 const W8A8QuantizedWeight& w8_weight,
+                                 Tensor& out,
+                                 aclrtStream stream) {
+    Tensor acc({1, w8_weight.N}, DType::Int32); acc.allocate();
+    matmul_w8a8_i32(x_int8, w8_weight.w_int8, acc, stream);
+    w8a8_dequant(acc, x_scale, w8_weight.w_scale, out, stream);
+}
+
 void matmul_decode_dispatch(const Tensor& x,
                             const Tensor* dense_weight,
                             const W4A16QuantizedWeight* quant_weight,
+                            const W8A8QuantizedWeight* w8_weight,
                             Tensor& out,
                             aclrtStream stream) {
+    if (w8a8_weight_ready(w8_weight) && x.shape().size() == 2 && x.shape()[0] == 1) {
+        Tensor x_int8(x.shape(), DType::Int8); x_int8.allocate();
+        Tensor x_scale({1}, DType::Float16); x_scale.allocate();
+        w8a8_quantize(x, x_int8, x_scale, stream);
+        matmul_decode_w8a8_prequant(x_int8, x_scale, *w8_weight, out, stream);
+        return;
+    }
     if (quant_weight != nullptr && x.shape().size() == 2 && x.shape()[0] == 1) {
         matmul_w4a16(x, quant_weight->w_int8, quant_weight->scales, out, stream);
         return;
@@ -928,9 +959,18 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     Tensor q_full({1, QProjOut}, DType::Float16); q_full.allocate();
     Tensor k_full({1, KVDim}, DType::Float16); k_full.allocate();
     Tensor v_full({1, KVDim}, DType::Float16); v_full.allocate();
-    matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, q_full, stream);
-    matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, k_full, stream);
-    matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, v_full, stream);
+    if (w8a8_weight_ready(weights.q_proj_w8)) {
+        Tensor normed_i8(normed.shape(), DType::Int8); normed_i8.allocate();
+        Tensor normed_scale({1}, DType::Float16); normed_scale.allocate();
+        w8a8_quantize(normed, normed_i8, normed_scale, stream);
+        matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.q_proj_w8, q_full, stream);
+        matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, nullptr, k_full, stream);
+        matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, nullptr, v_full, stream);
+    } else {
+        matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, weights.q_proj_w8, q_full, stream);
+        matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, weights.k_proj_w8, k_full, stream);
+        matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, weights.v_proj_w8, v_full, stream);
+    }
 
     Tensor q_only({1, QMainDim}, DType::Float16); q_only.allocate();
     Tensor q_gate({1, QMainDim}, DType::Float16); q_gate.allocate();
@@ -971,7 +1011,7 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
         sigmoid(q_gate, gate_sig, stream);
         Tensor attn_gated({1, QMainDim}, DType::Float16); attn_gated.allocate();
         mul(attn_out, gate_sig, attn_gated, stream);
-        matmul_decode_dispatch(attn_gated, weights.o_proj_weight, weights.o_proj_q, attn_proj, stream);
+        matmul_decode_dispatch(attn_gated, weights.o_proj_weight, weights.o_proj_q, weights.o_proj_w8, attn_proj, stream);
     }
 
     Tensor after_attn({1, Hidden}, DType::Float16); after_attn.allocate();
@@ -986,10 +1026,26 @@ void full_attention_decoder_layer_step(const Tensor& hidden,
     Tensor gated({1, Intermediate}, DType::Float16); gated.allocate();
     Tensor mlp_out({1, Hidden}, DType::Float16); mlp_out.allocate();
 
-    matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, gate, stream);
-    matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, up, stream);
+    if (w8a8_weight_ready(weights.gate_proj_w8) || w8a8_weight_ready(weights.up_proj_w8)) {
+        Tensor mlp_i8(mlp_in.shape(), DType::Int8); mlp_i8.allocate();
+        Tensor mlp_scale({1}, DType::Float16); mlp_scale.allocate();
+        w8a8_quantize(mlp_in, mlp_i8, mlp_scale, stream);
+        if (w8a8_weight_ready(weights.gate_proj_w8)) {
+            matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.gate_proj_w8, gate, stream);
+        } else {
+            matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, nullptr, gate, stream);
+        }
+        if (w8a8_weight_ready(weights.up_proj_w8)) {
+            matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.up_proj_w8, up, stream);
+        } else {
+            matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
+        }
+    } else {
+        matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, weights.gate_proj_w8, gate, stream);
+        matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, weights.up_proj_w8, up, stream);
+    }
     silu_mul(gate, up, gated, stream);
-    matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, mlp_out, stream);
+    matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, weights.down_proj_w8, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
 
@@ -1044,8 +1100,16 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     Tensor z({1, ValueDim}, DType::Float16); z.allocate();
     Tensor a({1, NumHeads}, DType::Float16); a.allocate();
     Tensor b({1, NumHeads}, DType::Float16); b.allocate();
-    matmul_decode_dispatch(normed, weights.in_proj_qkv_weight, weights.in_proj_qkv_q, qkv, stream);
-    matmul_decode_dispatch(normed, weights.in_proj_z_weight, weights.in_proj_z_q, z, stream);
+    if (w8a8_weight_ready(weights.in_proj_qkv_w8)) {
+        Tensor normed_i8(normed.shape(), DType::Int8); normed_i8.allocate();
+        Tensor normed_scale({1}, DType::Float16); normed_scale.allocate();
+        w8a8_quantize(normed, normed_i8, normed_scale, stream);
+        matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.in_proj_qkv_w8, qkv, stream);
+        matmul_decode_dispatch(normed, weights.in_proj_z_weight, weights.in_proj_z_q, nullptr, z, stream);
+    } else {
+        matmul_decode_dispatch(normed, weights.in_proj_qkv_weight, weights.in_proj_qkv_q, weights.in_proj_qkv_w8, qkv, stream);
+        matmul_decode_dispatch(normed, weights.in_proj_z_weight, weights.in_proj_z_q, weights.in_proj_z_w8, z, stream);
+    }
     matmul_b_transposed(normed, *weights.in_proj_a_weight, a, stream);
     matmul_b_transposed(normed, *weights.in_proj_b_weight, b, stream);
 
@@ -1104,7 +1168,7 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     gated_rms_norm_z(core_dev, z_silu, *weights.gated_norm_weight, gated, stream);
 
     Tensor attn_proj({1, Hidden}, DType::Float16); attn_proj.allocate();
-    matmul_decode_dispatch(gated, weights.out_proj_weight, weights.out_proj_q, attn_proj, stream);
+    matmul_decode_dispatch(gated, weights.out_proj_weight, weights.out_proj_q, weights.out_proj_w8, attn_proj, stream);
 
     Tensor after_attn({1, Hidden}, DType::Float16); after_attn.allocate();
     add(hidden, attn_proj, after_attn, stream);
@@ -1118,10 +1182,26 @@ void linear_attention_decoder_layer_step(const Tensor& hidden,
     Tensor gated_mlp({1, Intermediate}, DType::Float16); gated_mlp.allocate();
     Tensor mlp_out({1, Hidden}, DType::Float16); mlp_out.allocate();
 
-    matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, gate, stream);
-    matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, up, stream);
+    if (w8a8_weight_ready(weights.gate_proj_w8) || w8a8_weight_ready(weights.up_proj_w8)) {
+        Tensor mlp_i8(mlp_in.shape(), DType::Int8); mlp_i8.allocate();
+        Tensor mlp_scale({1}, DType::Float16); mlp_scale.allocate();
+        w8a8_quantize(mlp_in, mlp_i8, mlp_scale, stream);
+        if (w8a8_weight_ready(weights.gate_proj_w8)) {
+            matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.gate_proj_w8, gate, stream);
+        } else {
+            matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, nullptr, gate, stream);
+        }
+        if (w8a8_weight_ready(weights.up_proj_w8)) {
+            matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.up_proj_w8, up, stream);
+        } else {
+            matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
+        }
+    } else {
+        matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, weights.gate_proj_w8, gate, stream);
+        matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, weights.up_proj_w8, up, stream);
+    }
     silu_mul(gate, up, gated_mlp, stream);
-    matmul_decode_dispatch(gated_mlp, weights.down_proj_weight, weights.down_proj_q, mlp_out, stream);
+    matmul_decode_dispatch(gated_mlp, weights.down_proj_weight, weights.down_proj_q, weights.down_proj_w8, mlp_out, stream);
     add(after_attn, mlp_out, out, stream);
 }
 

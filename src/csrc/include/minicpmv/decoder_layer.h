@@ -41,6 +41,14 @@ struct FullAttentionDecoderLayerWeights {
     const W4A16QuantizedWeight* gate_proj_q{nullptr};
     const W4A16QuantizedWeight* up_proj_q{nullptr};
     const W4A16QuantizedWeight* down_proj_q{nullptr};
+
+    const W8A8QuantizedWeight* q_proj_w8{nullptr};
+    const W8A8QuantizedWeight* k_proj_w8{nullptr};
+    const W8A8QuantizedWeight* v_proj_w8{nullptr};
+    const W8A8QuantizedWeight* o_proj_w8{nullptr};
+    const W8A8QuantizedWeight* gate_proj_w8{nullptr};
+    const W8A8QuantizedWeight* up_proj_w8{nullptr};
+    const W8A8QuantizedWeight* down_proj_w8{nullptr};
 };
 
 void full_attention_decoder_layer(const Tensor& hidden,
@@ -119,6 +127,13 @@ struct LinearAttentionDecoderLayerWeights {
     const W4A16QuantizedWeight* gate_proj_q{nullptr};
     const W4A16QuantizedWeight* up_proj_q{nullptr};
     const W4A16QuantizedWeight* down_proj_q{nullptr};
+
+    const W8A8QuantizedWeight* in_proj_qkv_w8{nullptr};
+    const W8A8QuantizedWeight* in_proj_z_w8{nullptr};
+    const W8A8QuantizedWeight* out_proj_w8{nullptr};
+    const W8A8QuantizedWeight* gate_proj_w8{nullptr};
+    const W8A8QuantizedWeight* up_proj_w8{nullptr};
+    const W8A8QuantizedWeight* down_proj_w8{nullptr};
 };
 
 void linear_attention_decoder_layer(const Tensor& hidden,
